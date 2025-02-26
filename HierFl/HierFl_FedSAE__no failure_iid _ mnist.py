@@ -198,13 +198,13 @@ class FlowerClient(fl.client.NumPyClient):
       criterion = nn.CrossEntropyLoss()
 
       client_id = self.cid
-      num_epochs = config["num_epochs"]
+      num_epochs = config.get("k1", 60)
 
       print(f"Client {client_id}: Training for {num_epochs} epochs.")
 
       start_time = time.time()
 
-      for epoch in range(num_epochs):
+      for local_update in range(num_epochs):
           for inputs, labels in self.trainloader:
               inputs, labels = inputs.to(torch.device('cpu')), labels.to(torch.device('cpu'))
               optimizer.zero_grad()
@@ -229,13 +229,13 @@ class FlowerClient(fl.client.NumPyClient):
       return self.get_parameters(), len(self.trainloader.dataset), {"training_time": training_time}
 
 
-
-
-
 ########################################
 # Hierarchical Federated Learning with Flower
 #######################################
 def HierFL(args, trainloaders, valloaders, testloader):
+    global client_history, global_model
+    global_model = Net()
+    global_weights = get_parameters(global_model)
 
     # Initialize Edge Devices
     edge_devices = [EdgeDevice(i, trainloaders[i], valloaders[i]) for i in range(args['NUM_DEVICES'])]
@@ -248,8 +248,6 @@ def HierFL(args, trainloaders, valloaders, testloader):
         devices = edge_devices[start_idx:] if i == num_edge_servers - 1 else edge_devices[start_idx: start_idx + devices_per_server]
         edge_servers.append(EdgeServer(i, devices))
 
-    global client_history
-
     # ✅ Ensure all clients are initialized
     for client_id in range(args['NUM_DEVICES']):
         if client_id not in client_history:
@@ -257,10 +255,6 @@ def HierFL(args, trainloaders, valloaders, testloader):
                 "L": 50, "H": 70, "epochs": 50, "task": "Easy",
                 "training_time": [], "accuracy": []
             }
-
-    # Global Model
-    global_model = Net()
-    global_weights = get_parameters(global_model)
 
     def evaluate_fn(server_round, parameters, config):
         set_parameters(global_model, parameters)
@@ -277,48 +271,48 @@ def HierFL(args, trainloaders, valloaders, testloader):
         evaluate_fn=evaluate_fn,
     )
 
-    # Start Federated Training
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
-        selected_clients = random.sample(range(args['NUM_DEVICES']), min(2, args['NUM_DEVICES']))
-        print(f"\n🔵 Round {round_number}: Selected Clients -> {selected_clients}")
+        print(f"\n🔵 Round {round_number}")
+
+        # Select available clients
+        available_clients = [cid for cid in range(args['NUM_DEVICES'])]
+        if len(available_clients) < 2:
+            print("⚠️ Not enough available clients. Skipping round.")
+            continue
+
+        selected_clients = random.sample(available_clients, min(2, len(available_clients)))
+        print(f"🔹 Selected Clients: {selected_clients}")
 
         for client_id in selected_clients:
-            history = client_history[client_id]
-
-            before_L = history["L"]
-            before_H = history["H"]
-            before_task = history["task"]
-            before_epochs = history["epochs"]
-
-            # **Decide Training Strategy**
-            num_epochs = before_L  # Default to L
-            success = True  # Assume success
-            
-            print(f"Client {client_id}: Assigned task {before_task} with {num_epochs} epochs.")
-
-            # **Train Client**
             client = FlowerClient(
                 model=Net(),
                 trainloader=trainloaders[client_id],
                 testloader=testloader,
                 cid=client_id,
             )
-            _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
 
+            history = client_history[client_id]
+            before_L = history["L"]
+            before_H = history["H"]
+            before_task = history["task"]
+            before_epochs = history["epochs"]
+
+            # **Train Client with L-task**
+            print(f"Client {client_id}: Assigned task {before_task} with {before_L} epochs.")
+            _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": args["k1"]})
             training_time = train_metrics["training_time"]
 
-            # ✅ Ensure `training_time` key exists before updating
+            # ✅ Ensure training time is recorded in client history
             if "training_time" not in client_history[client_id]:
                 client_history[client_id]["training_time"] = []
-                
             client_history[client_id]["training_time"].append(training_time)
+
+            success = True  # Assume success initially
 
             # **Check if Client Can Attempt H**
             if before_task == "Easy":
-                num_epochs = before_H
-                print(f"Client {client_id}: Trying difficult task with {num_epochs} epochs.")
-
-                _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
+                print(f"Client {client_id}: Trying difficult task with {before_H} epochs.")
+                _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": args["k1"]})
                 training_time = train_metrics["training_time"]
 
                 # Simulated failure condition
@@ -335,10 +329,9 @@ def HierFL(args, trainloaders, valloaders, testloader):
                 history["H"] = max(20, before_H // 2)
                 history["task"] = "Easy"
 
-            # Store updates in history
             history["epochs"] = history["L"]
 
-            # Log to CSV
+            # ✅ **Move CSV Logging Inside the Loop**
             with open('client_task_log.csv', 'a', newline='') as file:
                 writer = csv.writer(file)
                 if os.stat("client_task_log.csv").st_size == 0:
@@ -349,7 +342,21 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
             print(f"Client {client_id}: Finished round with new L={history['L']}, H={history['H']}, Task={history['task']}")
 
-    print(f"✅ Federated Training Complete! Results saved to client_task_log.csv.")
+        # 🔹 **Perform Edge Aggregation every k2 rounds**
+        if round_number % args["k2"] == 0:
+            print(f"🔹 Aggregating at EDGE SERVER (every {args['k2']} rounds)")
+            for edge_server in edge_servers:
+                aggregated_params = edge_server.aggregate()
+                set_parameters(edge_server.model, aggregated_params)
+
+        # 🌍 **Perform Global Aggregation every (k1 × k2) rounds**
+        if round_number % (args["k1"] * args["k2"]) == 0:
+            print(f"🌍 Aggregating at GLOBAL SERVER (every {args['k1'] * args['k2']} rounds)")
+            global_weights = get_parameters(global_model)
+            set_parameters(global_model, global_weights)
+
+    print("✅ Federated Training Complete!")
+
 
 
 
