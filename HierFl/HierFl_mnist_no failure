@@ -246,7 +246,22 @@ def HierFL(args, trainloaders, valloaders, testloader):
         
     save_metrics_to_csv(metrics, "mnist_results.csv")
     plot_metrics(metrics)
+    
+#Edge Aggregation every k2 rounds**
 
+if round_number % args["k2"] == 0:
+            print(f"🔹 Aggregating at EDGE SERVER (every {args['k2']} rounds)")
+            for edge_server in edge_servers:
+                aggregated_params = edge_server.aggregate()
+                set_parameters(edge_server.model, aggregated_params)
+
+# Global Aggregation every (k1 × k2) rounds**
+if round_number % (args["k1"] * args["k2"]) == 0:
+            print(f"🌍 Aggregating at GLOBAL SERVER (every {args['k1'] * args['k2']} rounds)")
+            global_weights = get_parameters(global_model)
+            set_parameters(global_model, global_weights)
+
+print("✅ Federated Training Complete!")
 ########################################
 # Utility Functions
 ########################################
@@ -307,5 +322,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
