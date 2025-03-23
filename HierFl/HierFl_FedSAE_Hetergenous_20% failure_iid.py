@@ -224,7 +224,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
 
             # ✅ Step 7: Log only the selected clients
-            #log_file.write(f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f}\n")
+            log_file.write(f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f}\n")
 
             # ✅ Step 8: **Explicitly update the client's `lower_bound` and `upper_bound` again to ensure consistency**
             client.lower_bound = L_tk_after
@@ -258,8 +258,8 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
     log_file_path = "client_task_log.csv"
     recovered_this_round = set()
 
-    #with open(log_file_path, "a") as log_file:
-        #log_file.write(f"Round {round_number} - Failure Log\n")  # Separate failure logs for readability
+    with open(log_file_path, "a") as log_file:
+        log_file.write(f"Round {round_number} - Failure Log\n")  # Separate failure logs for readability
 
         selected_clients = selected_clients or []
 
@@ -280,7 +280,7 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
             failure_log.append([client_id, failure_duration, training_times])  # Track failures
 
             # ✅ Log failure event
-            #log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},,,,\n")
+            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},,,,\n")
 
 
 
@@ -313,7 +313,7 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
                     print(f"🔄 Client {client_id} RECOVERED and is now available.")
 
                     # ✅ Log recovery event
-                    #log_file.write(f"{round_number},{client_id},RECOVERED,0,{recovery_time:.2f},{training_time:.2f},{remaining_time:.2f},,,,\n")
+                    log_file.write(f"{round_number},{client_id},RECOVERED,0,{recovery_time:.2f},{training_time:.2f},{remaining_time:.2f},,,,\n")
 
 
         # Remove recovered clients from failure log
