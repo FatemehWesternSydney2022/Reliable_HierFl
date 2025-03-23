@@ -141,7 +141,9 @@ def test(net, testloader):
 ########################################
 # Adjust L and H After Each Round
 ########################################
-def adjust_task_assignment(clients, round_number, alpha, r1, r2):
+client_previous_bounds = {}
+
+def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times):
     """
     Adjusts the task assignment based on each client's affordable workload and dynamic threshold.
     Ensures that each client is logged only once per round.
@@ -151,8 +153,22 @@ def adjust_task_assignment(clients, round_number, alpha, r1, r2):
     :param alpha: Smoothing factor for threshold updates.
     :param r1, r2: Adjustment factors for workload updates.
     """
+    global client_previous_bounds  # Access the global dictionary
+
     with open(log_file_path, "a") as log_file:
         for client in clients:
+            # ❌ Skip unselected clients
+            if client.cid not in selected_clients:
+                continue
+
+            training_time = training_times.get(client.cid, 0)
+
+            # ✅ Step 1: Retrieve previous round bounds if client was selected before
+            if client.cid in client_previous_bounds:
+                L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
+            else:
+                L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
+
             # ✅ Ensure workload is updated only ONCE per round
             if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
                 mu_k = np.random.uniform(50, 60)
@@ -168,13 +184,14 @@ def adjust_task_assignment(clients, round_number, alpha, r1, r2):
             if not hasattr(client, 'threshold'):
                 client.threshold = 0
 
-            # ✅ Store previous bounds before update
-            L_tk_before, H_tk_before = client.lower_bound, client.upper_bound
+            # ✅ Step 2: Maintain previous bounds if client has been selected before
+            if client.cid in client_previous_bounds:
+                client.lower_bound, client.upper_bound = client_previous_bounds[client.cid]
 
-            # ✅ Update threshold
+            # ✅ Step 3: Update threshold
             client.threshold = alpha * client.threshold + (1 - alpha) * client.affordable_workload
 
-            # ✅ Update workload range based on conditions
+            # ✅ Step 4: Adjust workload range based on conditions
             if client.affordable_workload > H_tk_before:
                 if client.threshold <= L_tk_before:
                     client.lower_bound += r2
@@ -199,11 +216,20 @@ def adjust_task_assignment(clients, round_number, alpha, r1, r2):
                     client.upper_bound = 0.5 * H_tk_before
                     client.affordable_workload = 0
 
-            # ✅ Capture L_tk and H_tk after adjustment
-            L_tk_after, H_tk_after = client.lower_bound, client.upper_bound
+            # ✅ Step 5: Capture updated values after adjustment
+            L_tk_after = client.lower_bound
+            H_tk_after = client.upper_bound
 
-            # ✅ Log each client only ONCE per round
-            log_file.write(f"{round_number},{client.cid},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f}\n")
+            # ✅ Step 6: Store updated bounds for future reference
+            client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
+
+            # ✅ Step 7: Log only the selected clients
+            #log_file.write(f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f}\n")
+
+            # ✅ Step 8: **Explicitly update the client's `lower_bound` and `upper_bound` again to ensure consistency**
+            client.lower_bound = L_tk_after
+            client.upper_bound = H_tk_after
+
 
     return clients
 
@@ -226,15 +252,20 @@ def compute_training_rounds(client_id, clients, base_k1):
 ########################################
 # Random Failure Simulation
 ########################################
-def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_time, clients):
+def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, clients , selected_clients):
     """Simulates client failures and updates the failure log dynamically per round."""
-    
+
     log_file_path = "client_task_log.csv"
-    with open(log_file_path, "a") as log_file:
-        log_file.write(f"Round {round_number} - Failure Log\n")  # Separate failure logs for readability
+    recovered_this_round = set()
+
+    #with open(log_file_path, "a") as log_file:
+        #log_file.write(f"Round {round_number} - Failure Log\n")  # Separate failure logs for readability
+
+        selected_clients = selected_clients or []
 
         # Identify currently available clients
-        available_clients = [cid for cid, unavailable in unavailability_tracker.items() if unavailable == 0]
+
+        available_clients = [cid for cid in range(args["NUM_DEVICES"])if unavailability_tracker[cid] == 0 and cid not in (selected_clients or []) and cid not in recovered_this_round]
 
         # Calculate number of failures (ensure at least one)
         num_failures = max(1, int(len(available_clients) * args['FAILURE_RATE']))
@@ -246,25 +277,35 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
         for client_id in failing_clients:
             failure_duration = random.randint(1, args['FAILURE_DURATION'])
             unavailability_tracker[client_id] = failure_duration  # Store failure duration
-            failure_log.append([client_id, failure_duration])  # Track failures
+            failure_log.append([client_id, failure_duration, training_times])  # Track failures
 
             # ✅ Log failure event
-            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration} rounds\n")
+            #log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},,,,\n")
+
+
 
         # ✅ Update failing clients' recovery countdown
         for client in failure_log:
-            client_id, remaining_time = client[0], client[1]
-            unavailability_tracker[client_id] -= training_time  # Reduce remaining time
-            client[1] = max(0, remaining_time - training_time)
+          client_id, remaining_time = client[0], client[1]
+          training_time = training_times.get(client_id, 0)  # Get the correct time for each client
+          unavailability_tracker[client_id] = max(0, unavailability_tracker[client_id] - training_time)
+          client[1] = max(0, remaining_time - training_time)
+
 
         # ✅ Recover clients whose failure time reaches 0
         recovered_clients = [c for c in failure_log if c[1] == 0]
-        
+        recovered_this_round = {c[0] for c in recovered_clients}
+
         for client in recovered_clients:
             client_id = client[0]
+            remaining_time = client[1]
+            training_time = training_times.get(client_id, 0)
+            recovery_time = training_time - remaining_time
             unavailability_tracker[client_id] = 0  # Mark client as available
-            
-            
+            recovered_this_round.add(client_id)
+
+
+
             # ✅ Reset affordable workload for recovered clients
             for c in clients:
                 if c.cid == client_id:
@@ -272,12 +313,13 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
                     print(f"🔄 Client {client_id} RECOVERED and is now available.")
 
                     # ✅ Log recovery event
-                    log_file.write(f"{round_number},{client_id},RECOVERED,0 rounds\n")
+                    #log_file.write(f"{round_number},{client_id},RECOVERED,0,{recovery_time:.2f},{training_time:.2f},{remaining_time:.2f},,,,\n")
+
 
         # Remove recovered clients from failure log
         failure_log[:] = [c for c in failure_log if c[1] > 0]
 
-    return failure_log
+    return failure_log, recovered_this_round
 
 
 ########################################
@@ -430,14 +472,29 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
-        with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client,Status,LowerBound,UpperBound,AffordableWorkload,Epochs,RemainingRecoveryTime\n")
-    
+        with open("client_task_log.csv", "w") as log_file:
+          log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload\n")
+
+
+
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
         start_time = time.time()
-        
-        # ✅ Simulate client failures before selecting clients
-        failure_log = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_time=5, clients= clients)
+
+        training_times = {}
+        recovered_this_round = set()
+
+        # ✅ Simulate client failures before training selection
+        failure_log, recovered_this_round = simulate_failures(
+            args, unavailability_tracker, failure_log,
+            round_number, training_times, clients=clients,
+            selected_clients=None
+        )
+
+        # ✅ Filter available clients
+        available_clients = [
+            cid for cid in range(args["NUM_DEVICES"])
+            if unavailability_tracker[cid] == 0 and cid not in recovered_this_round
+        ]
 
         # ✅ Log failed clients
         with open(log_file_path, "a") as log_file:
@@ -446,35 +503,41 @@ def HierFL(args, trainloaders, valloaders, testloader):
                 if remaining_time > 0:
                     log_file.write(f"{round_number},{client_id},FAILED,,,,,{remaining_time} sec\n")
 
-        # ✅ Filter only available clients for training
-        available_clients = [cid for cid in range(args["NUM_DEVICES"]) if unavailability_tracker[cid] == 0]
-
         if not available_clients:
             print(f"⚠️ No available clients in round {round_number}. Skipping round.")
-            continue  
+            continue
 
-        selected_clients = random.sample(available_clients, min(2, len(available_clients)))
+        selected_clients = random.sample(available_clients, min(10, len(available_clients)))
 
-        for client_id in selected_clients:
-            num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
-            client = clients[client_id]  # ✅ Correctly reference the client
+        with open(log_file_path, "a") as log_file:
+            for client_id in selected_clients:
+                num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
+                client = clients[client_id]
 
-            # ✅ Train the client before logging
-            _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
+                # ✅ Train the client
+                _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
+                training_time = train_metrics["training_time"]
+                training_times[client_id] = training_time
 
-            # ✅ Log training clients with workload details
-            with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,{client.lower_bound},{client.upper_bound},{client.affordable_workload:.2f},{num_epochs},\n")
+                # ✅ Log training info
+                log_file.write(f"{round_number},{client_id},TRAINING,,,{training_time:.2f},{client.lower_bound},{client.upper_bound},{client.lower_bound + 1},{client.upper_bound + 1},{client.affordable_workload:.2f},{num_epochs}\n")
+
+        # ✅ Adjust workloads
+        adjust_task_assignment(
+            round_number, clients, selected_clients,
+            log_file_path, args['alpha'], args['r1'], args['r2'], training_times
+        )
+
 
         # ✅ Edge Aggregation
-        if round_number % args["k2"] == 0:
+    if round_number % args["k2"] == 0:
             print(f"🔹 Aggregating at EDGE SERVER (every {args['k2']} rounds)")
             for edge_server in edge_servers:
                 aggregated_params = edge_server.aggregate()
                 set_parameters(edge_server.model, aggregated_params)
 
         # ✅ Global Aggregation
-        if round_number % (args["k1"] * args["k2"]) == 0:
+    if round_number % (args["k1"] * args["k2"]) == 0:
             print(f"🌍 Aggregating at GLOBAL SERVER (every {args['k1'] * args['k2']} rounds)")
             global_weights = get_parameters(global_model)
             set_parameters(global_model, global_weights)
@@ -508,13 +571,13 @@ def main():
         return trainloaders, valloaders, testloader
 
     args = {
-        'NUM_DEVICES': 10,
+        'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':10,
+        'GLOBAL_ROUNDS':50,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        'CLIENT_FRACTION': 0.2,
-        'EVALUATE_FRACTION': 0.2,
+        'CLIENT_FRACTION': 0.5,
+        'EVALUATE_FRACTION': 0.5,
         'FAILURE_RATE': 0.2,
         'FAILURE_DURATION': 50,
         'alpha': 0.95,
@@ -531,5 +594,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
