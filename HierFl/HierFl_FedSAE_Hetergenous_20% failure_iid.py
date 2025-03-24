@@ -261,29 +261,6 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
     with open(log_file_path, "a") as log_file:
         log_file.write(f"Round {round_number} - Failure Log\n")  # Separate failure logs for readability
 
-        selected_clients = selected_clients or []
-
-        # Identify currently available clients
-
-        available_clients = [cid for cid in range(args["NUM_DEVICES"])if unavailability_tracker[cid] == 0 and cid not in (selected_clients or []) and cid not in recovered_this_round]
-
-        # Calculate number of failures (ensure at least one)
-        num_failures = max(1, int(len(available_clients) * args['FAILURE_RATE']))
-
-        # Select clients to fail (only from available clients)
-        failing_clients = random.sample(available_clients, min(num_failures, len(available_clients)))
-
-        # Assign failure durations
-        for client_id in failing_clients:
-            failure_duration = random.randint(1, args['FAILURE_DURATION'])
-            unavailability_tracker[client_id] = failure_duration  # Store failure duration
-            failure_log.append([client_id, failure_duration, training_times])  # Track failures
-
-            # ✅ Log failure event
-            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},,,,\n")
-
-
-
         # ✅ Update failing clients' recovery countdown
         for client in failure_log:
           client_id, remaining_time = client[0], client[1]
@@ -318,6 +295,26 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
         # Remove recovered clients from failure log
         failure_log[:] = [c for c in failure_log if c[1] > 0]
+
+        selected_clients = selected_clients or []
+
+        # Identify currently available clients
+        available_clients = [cid for cid in range(args["NUM_DEVICES"])if unavailability_tracker[cid] == 0 and cid not in (selected_clients or []) and cid not in recovered_this_round]
+
+        # Calculate number of failures (ensure at least one)
+        num_failures = max(1, int(len(available_clients) * args['FAILURE_RATE']))
+
+        # Select clients to fail (only from available clients)
+        failing_clients = random.sample(available_clients, min(num_failures, len(available_clients)))
+
+        # Assign failure durations
+        for client_id in failing_clients:
+            failure_duration = random.randint(1, args['FAILURE_DURATION'])
+            unavailability_tracker[client_id] = failure_duration  # Store failure duration
+            failure_log.append([client_id, failure_duration, training_times])  # Track failures
+
+            # ✅ Log failure event
+            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},,,,\n")
 
     return failure_log, recovered_this_round
 
@@ -594,6 +591,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
