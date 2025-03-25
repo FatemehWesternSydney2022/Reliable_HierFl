@@ -160,38 +160,49 @@ def test(net, testloader):
 ########################################
 # Adjust L and H After Each Round
 ########################################
-def adjust_task_assignment(clients, round_number, alpha, r1, r2, lstm_model):
-    """
-    Adjusts the task assignment based on each client's affordable workload and dynamic threshold.
-    Uses LSTM failure prediction to adjust workload in advance.
+client_previous_bounds = {}
 
-    :param clients: List of client objects containing workload information.
-    :param round_number: The current global round.
-    :param alpha: Smoothing factor for threshold updates.
-    :param r1, r2: Adjustment factors for workload updates.
-    :param lstm_model: Trained LSTM model for predicting failures.
+def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times, lstm_model):
     """
+    Linear drop workload adjustment strategy:
+    - Linear Drop affordable workload to 0 .
+    - Otherwise, sample workload based on recent training history.
+    """
+    global client_previous_bounds  # Access the global dictionary
+
     with open(log_file_path, "a") as log_file:
         for client in clients:
-            # ✅ Predict next failure time using LSTM
-            predicted_failure = predict_failures(lstm_model, client.cid, client_failure_history)
+            # ❌ Skip unselected clients
+            if client.cid not in selected_clients:
+                continue
 
-            # ✅ Calculate rounds until failure
-            rounds_until_failure = predicted_failure - round_number if predicted_failure else None
+            training_time = training_times.get(client.cid, 0)
 
-            # ✅ Ensure workload is updated only ONCE per round
-            if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
+            # ✅ Predict time to failure in seconds
+            time_fail = predict_time_to_failure(lstm_model, client_failure_history, client.cid) if lstm_model else None
+            client.predicted_failure_time = time_fail
+          
+
+            # ✅ Step 1: Retrieve previous round bounds if client was selected before
+            if client.cid in client_previous_bounds:
+                L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
+            else:
+                L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
+
+            # 🔻Sharply Increase and then Sudden Drop one Second before failure 
+            if time_fail is not None:
+              if time_fail <= 1:
+                  client.affordable_workload = 0
+              else:
+                  P = 1.0
+                  client.affordable_workload =  client.affordable_workload * (1 + P)
+
+            # ✅ Normal Worklaod pattern
+            elif not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
                 mu_k = np.random.uniform(50, 60)
                 sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
                 client.affordable_workload = np.random.normal(mu_k, sigma_k)
                 client.affordable_workload_logged = round_number  # Mark as updated for this round
-
-            # ✅ Adjust workload dynamically based on predicted failure
-            if rounds_until_failure:
-                if rounds_until_failure <= 2:
-                    client.threshold = max(client.threshold - r2, client.lower_bound)  # Reduce by r2
-                elif rounds_until_failure <= 5:
-                    client.threshold = max(client.threshold - r1, client.lower_bound)  # Reduce by r1
 
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
@@ -201,13 +212,14 @@ def adjust_task_assignment(clients, round_number, alpha, r1, r2, lstm_model):
             if not hasattr(client, 'threshold'):
                 client.threshold = 0
 
-            # ✅ Store previous bounds before update
-            L_tk_before, H_tk_before = client.lower_bound, client.upper_bound
+            # ✅ Step 2: Maintain previous bounds if client has been selected before
+            if client.cid in client_previous_bounds:
+                client.lower_bound, client.upper_bound = client_previous_bounds[client.cid]
 
-            # ✅ Update threshold with moving average
+            # ✅ Step 3: Update threshold
             client.threshold = alpha * client.threshold + (1 - alpha) * client.affordable_workload
 
-            # ✅ Update workload range dynamically
+            # ✅ Step 4: Adjust workload range based on conditions
             if client.affordable_workload > H_tk_before:
                 if client.threshold <= L_tk_before:
                     client.lower_bound += r2
@@ -232,13 +244,25 @@ def adjust_task_assignment(clients, round_number, alpha, r1, r2, lstm_model):
                     client.upper_bound = 0.5 * H_tk_before
                     client.affordable_workload = 0
 
-            # ✅ Capture L_tk and H_tk after adjustment
-            L_tk_after, H_tk_after = client.lower_bound, client.upper_bound
+            # ✅ Step 5: Capture updated values after adjustment
+            L_tk_after = client.lower_bound
+            H_tk_after = client.upper_bound
 
-            # ✅ Log each client only ONCE per round
-            log_file.write(f"{round_number},{client.cid},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f}\n")
+            # ✅ Step 6: Store updated bounds for future reference
+            client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
+
+            # ✅ Step 7: Log only the selected clients with prediction
+            log_file.write(
+                f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},"
+                f"{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{time_fail:.2f} sec\n"
+            )
+
+            # ✅ Step 8: Explicitly update bounds again
+            client.lower_bound = L_tk_after
+            client.upper_bound = H_tk_after
 
     return clients
+
 
 
 ########################################
@@ -255,20 +279,7 @@ def compute_training_rounds(client_id, clients, base_k1):
     # Scale up if training time is too short
     return max(training_rounds, 20)  # Ensures at least 20 epochs
 
-########################################
-# Predict Client Failures Using LSTM
-########################################
-def predict_failures(lstm_model, client_id, failure_history):
-    if client_id not in failure_history or len(failure_history[client_id]) < 5:
-        return None
 
-    failure_intervals = np.diff(failure_history[client_id])[-5:]
-    X_input = torch.tensor(failure_intervals, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
-
-    with torch.no_grad():
-        predicted_interval = lstm_model(X_input).item()
-
-    return failure_history[client_id][-1] + int(predicted_interval)
 
 ########################################
 # Random Failure Simulation
@@ -288,16 +299,18 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
             # ✅ Store failure history
             client_failure_history.setdefault(client_id, []).append(round_number)
 
-            # ✅ Predict next failure using LSTM
-            predicted_next_failure = predict_failures(lstm_model, client_id, client_failure_history)
+            predicted_next_failure = predict_time_to_failure(lstm_model, client_failure_history, client_id) if lstm_model else None
+
 
             unavailability_tracker[client_id] = failure_duration
             failure_log.append([client_id, failure_duration])
 
             # ✅ Log failure event with predicted next failure round
             log_file.write(
-                f"{round_number},{client_id},FAILED,Duration: {failure_duration} rounds,"
-                f"Will Recover at: Round {recovery_round},Next Failure (Predicted): Round {predicted_next_failure if predicted_next_failure else 'Unknown'}\n"
+                f"{round_number},{client_id},FAILED,Duration: {failure_duration} ,"
+                f"Next Failure (Predicted): Round {predicted_next_failure if predicted_next_failure else 'Unknown'}\n,"
+    
+
             )
 
         # ✅ Process Recovering Clients
@@ -325,47 +338,88 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 # Training LSTM with Failure History
 ########################################
 def prepare_failure_data(history, sequence_length=5):
-    """
-    Convert client failure history into sequences for LSTM training.
-    """
     sequences, labels = [], []
-    for client_id, failure_rounds in history.items():
-        failure_intervals = np.diff(failure_rounds) if len(failure_rounds) > 1 else [0]
-        for i in range(len(failure_intervals) - sequence_length):
-            sequences.append(failure_intervals[i:i + sequence_length])
-            labels.append(failure_intervals[i + sequence_length])
+    for client_id, timestamps in history.items():
+        if len(timestamps) < sequence_length + 1:
+            continue
+        time_diffs = np.diff(timestamps).tolist()
+        for i in range(len(time_diffs) - sequence_length):
+            sequences.append(time_diffs[i:i + sequence_length])
+            labels.append(time_diffs[i + sequence_length])
+    if not sequences:
+        return None, None
+    sequences = torch.tensor(sequences, dtype=torch.float32).unsqueeze(-1)
+    labels = torch.tensor(labels, dtype=torch.float32)
+    return sequences, labels
 
-    sequences, labels = np.array(sequences), np.array(labels)
-    return torch.tensor(sequences, dtype=torch.float32).unsqueeze(-1), torch.tensor(labels, dtype=torch.float32)
-
+########################################
+# Train LSTM to predict seconds until failure
+########################################
 def train_failure_predictor(history, epochs=50, lr=0.001):
-    """
-    Train LSTM to predict time until next failure.
-    """
-    if len(history) < 5:
-        print("⚠️ Not enough failure history to train LSTM.")
+    X, y = prepare_failure_data(history)
+    if X is None:
+        print("❌ Not enough history to train LSTM.")
         return None
 
-    model = LSTMFailurePredictor().to(torch.device('cpu'))
+    model = LSTMFailurePredictor()
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    X_train, y_train = prepare_failure_data(history)
-    dataset = torch.utils.data.TensorDataset(X_train, y_train)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
+    dataset = torch.utils.data.TensorDataset(X, y)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
 
     for epoch in range(epochs):
-        for X_batch, y_batch in dataloader:
+        for xb, yb in loader:
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch.unsqueeze(-1))
+            out = model(xb)
+            loss = criterion(out.squeeze(), yb)
             loss.backward()
             optimizer.step()
-
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
-
+            print(f"Epoch {epoch}: loss = {loss.item():.4f}")
     return model
+
+########################################
+# Predict seconds until next failure
+########################################
+def predict_time_to_failure(model, history, client_id):
+    if not isinstance(history, dict) or client_id not in history:
+        return None
+
+    failure_rounds = history[client_id]
+
+    # 🔹 Case 1: Client has at least 2 failure rounds → use own intervals
+    if len(failure_rounds) >= 2:
+        intervals = np.diff(failure_rounds).tolist()
+        if len(intervals) >= 5:
+            input_intervals = intervals[-5:]
+        else:
+            padding = [intervals[-1]] * (5 - len(intervals))
+            input_intervals = padding + intervals
+
+    else:
+        # 🔹 Case 2: Client has <2 failures → use average of other clients
+        all_intervals = []
+        for cid, rounds in history.items():
+            if cid == client_id or len(rounds) < 2:
+                continue
+            all_intervals.extend(np.diff(rounds).tolist())
+
+        if not all_intervals:
+            # 🧊 Cold-start fallback: just use 5 copies of a default interval
+            input_intervals = [50] * 5
+        else:
+            avg_interval = sum(all_intervals) / len(all_intervals)
+            input_intervals = [avg_interval] * 5
+
+    # ✅ Format for LSTM
+    x_input = torch.tensor(input_intervals, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+
+    with torch.no_grad():
+        pred = model(x_input).item()
+
+    return max(0.0, pred)
+
 
 ########################################
 # FlowerClient Class
@@ -526,20 +580,31 @@ def HierFL(args, trainloaders, valloaders, testloader):
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
         start_time = time.time()
 
-        # ✅ Simulate failures before selecting clients
-        failure_log = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_time=5, clients=clients, lstm_model= lstm_model)
-
-        # ✅ Adjust workloads before selecting clients using failure predictions
-        if lstm_model:
-            clients = adjust_task_assignment(clients, round_number, args['alpha'], args['r1'], args['r2'], lstm_model)
-
         # ✅ Select only available clients for training
         available_clients = [cid for cid in range(args["NUM_DEVICES"]) if unavailability_tracker[cid] == 0]
         if not available_clients:
             print(f"⚠️ No available clients in round {round_number}. Skipping round.")
             continue
 
-        selected_clients = random.sample(available_clients, min(2, len(available_clients)))
+        selected_clients = random.sample(available_clients, min(10, len(available_clients)))
+
+        # ✅ Simulate failures before selecting clients
+        failure_log = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_time=5, clients=clients, lstm_model= lstm_model)
+
+        # ✅ Adjust workloads before selecting clients using failure predictions
+        training_times = {client.cid: client_history.get(client.cid, {}).get("training_time", [0])[-1] for client in clients}
+        if lstm_model:
+            adjust_task_assignment(
+                round_number=round_number,
+                clients=clients,
+                selected_clients=selected_clients,
+                log_file_path=log_file_path,
+                alpha=args['alpha'],
+                r1=args['r1'],
+                r2=args['r2'],
+                training_times=training_times,  # ideally tracked over rounds
+                lstm_model=lstm_model
+            )
 
 
         for client_id in selected_clients:
@@ -549,9 +614,10 @@ def HierFL(args, trainloaders, valloaders, testloader):
             # ✅ Train the client before logging
             _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
 
+            predicted_time = getattr(client, "predicted_failure_time", -1.0)
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,{client.lower_bound},{client.upper_bound},{client.affordable_workload:.2f},{num_epochs},\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,{client.lower_bound},{client.upper_bound},{client.affordable_workload:.2f},{num_epochs},{client.threshold:.2f},{predicted_time:.2f},\n")
 
         # ✅ Edge Aggregation
         if round_number % args["k2"] == 0:
@@ -595,7 +661,7 @@ def main():
         return trainloaders, valloaders, testloader
 
     args = {
-        'NUM_DEVICES': 10,
+        'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
         'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
