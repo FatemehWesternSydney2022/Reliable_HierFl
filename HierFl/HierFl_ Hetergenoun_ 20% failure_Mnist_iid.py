@@ -37,7 +37,7 @@ if torch.cuda.is_available():
 log_file_path = "training_log.csv"
 if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client ID,NumEpoch,AffordableWorkload,TrainingTime\n")
+            log_file.write("Round,Client ID,NumEpoch,AffordableWorkload,TrainingTime,Status,FailureDuration\n")
 
 ########################################
 # Machine Learning Model (Net)
@@ -127,19 +127,19 @@ def get_parameters(model) -> List[np.ndarray]:
 def set_parameters(model: nn.Module, parameters: Optional[List[np.ndarray]]):
     if parameters is None:
         print("⚠ Warning: Received NoneType parameters. Skipping model update.")
-        return  
+        return
 
     print(f"✅ Updating model with {len(parameters)} parameter tensors.")  # Debugging print
     params_dict = zip(model.state_dict().keys(), parameters)
     state_dict = OrderedDict({k: torch.tensor(v, dtype=torch.float32) for k, v in params_dict})
     model.load_state_dict(state_dict, strict=True)
- 
+
 def test(net, testloader):
     net.eval()
     correct, total = 0, 0
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
- 
+
     with torch.no_grad():
         for inputs, labels in testloader:
             inputs, labels = inputs.to(torch.device('cpu')), labels.to(torch.device('cpu'))
@@ -148,7 +148,7 @@ def test(net, testloader):
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
- 
+
     accuracy = 100.0 * correct / total
     avg_loss = total_loss / len(testloader)
     return avg_loss, accuracy
@@ -221,7 +221,7 @@ def compute_training_rounds(client):
     """
     Compute k1 directly from the client's affordable workload.
     No normalization or scaling is applied.
-    
+
     :param client: The specific client for which k1 is being calculated.
     :return: k1 value for the specific client.
     """
@@ -240,13 +240,13 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
     num_failures = int(len(available_clients) * args['FAILURE_RATE'])
     num_failures = max(1, num_failures)  # Ensure at least one client fails
 
-   
+
 
     # Ensure failure is only assigned to NEW available clients, not already failing ones
     failing_clients = [
         cid for cid in available_clients if cid not in [c[0] for c in failure_log]
     ]
-    
+
     failing_clients = random.sample(failing_clients, min(num_failures, len(failing_clients)))
 
     # Assign failure durations and update log
@@ -257,6 +257,10 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
         unavailability_tracker[client_id] = 1  # Mark as unavailable
         new_failures.append([client_id, failure_duration, recovery_time_remaining])
+
+        with open(log_file_path, "a") as log_file:
+            log_file.write(f"{round_number},{client_id},0,0,{training_time},FAILED,{failure_duration}\n")
+            log_file.flush()
 
     # Append new failures to log
     failure_log.extend(new_failures)
@@ -298,7 +302,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
     # ✅ Compute k1 values ONCE before training starts
     k1_values = {
-        cid: compute_training_rounds(edge_devices[cid].get_client())  
+        cid: compute_training_rounds(edge_devices[cid].get_client())
         for cid in range(args['NUM_DEVICES'])
     }
 
@@ -352,7 +356,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
         if not available_clients:
             print(f"⚠️ No available clients in round {round_number}. Skipping.")
-            continue  
+            continue
 
         selected_clients = random.sample(available_clients, max(1, int(len(available_clients) * args['CLIENT_FRACTION'])))
 
@@ -368,7 +372,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
             # ✅ Log training details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},{num_epochs},{client.affordable_workload:.2f},{training_time:.2f}\n")
+                log_file.write(f"{round_number},{client_id},{num_epochs},{client.affordable_workload:.2f},{training_time:.2f},TRAINING,0\n")
                 log_file.flush()
 
         # ✅ Edge Aggregation
@@ -419,7 +423,7 @@ def main():
     args = {
         'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS': 50,
+        'GLOBAL_ROUNDS': 10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.5,
