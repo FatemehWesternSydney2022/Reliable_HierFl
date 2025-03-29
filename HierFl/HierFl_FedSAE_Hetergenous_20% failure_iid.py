@@ -40,7 +40,7 @@ if torch.cuda.is_available():
 #history of clients
 ########################################
 client_history = {}
-
+training_times = {}
 ########################################
 # Machine Learning Model (Net)
 ########################################
@@ -162,6 +162,10 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 continue
 
             training_time = training_times.get(client.cid, 0)
+            STAGE_INCREASING = "INCREASING"
+            STAGE_STABLE = "STABLE"
+            STAGE_DROPOUT = "DROPOUT"
+            stage = None
 
             # ✅ Step 1: Retrieve previous round bounds if client was selected before
             if client.cid in client_previous_bounds:
@@ -196,40 +200,48 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 if client.threshold <= L_tk_before:
                     client.lower_bound += r2
                     client.upper_bound += r2
+                    stage = STAGE_INCREASING
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound += r1
                     client.upper_bound += r2
+                    stage = STAGE_INCREASING
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
                     client.affordable_workload = H_tk_before
+                    stage = STAGE_INCREASING
+
             elif L_tk_before < client.affordable_workload <= H_tk_before:
                 if client.threshold >= L_tk_before:
                     client.lower_bound = min(client.lower_bound + r2, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r2, 0.5 * H_tk_before)
+                    stage = STAGE_STABLE
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.affordable_workload = L_tk_before
-                else:
+                    stage = STAGE_STABLE
+
+            else:
                     client.lower_bound = 0.5 * L_tk_before
                     client.upper_bound = 0.5 * H_tk_before
                     client.affordable_workload = 0
+                    stage = STAGE_DROPOUT
 
             # ✅ Step 5: Capture updated values after adjustment
             L_tk_after = client.lower_bound
             H_tk_after = client.upper_bound
 
+            
             # ✅ Step 6: Store updated bounds for future reference
             client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
 
             # ✅ Step 7: Log only the selected clients
-            log_file.write(f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f}\n")
+            log_file.write(f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{stage}\n")
 
             # ✅ Step 8: **Explicitly update the client's `lower_bound` and `upper_bound` again to ensure consistency**
             client.lower_bound = L_tk_after
             client.upper_bound = H_tk_after
-
 
     return clients
 
@@ -252,69 +264,67 @@ def compute_training_rounds(client_id, clients, base_k1):
 ########################################
 # Random Failure Simulation
 ########################################
-def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, clients , selected_clients):
+def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients):
     """Simulates client failures and updates the failure log dynamically per round."""
+     #Identify clients who are available (not currently failing)
 
-    log_file_path = "client_task_log.csv"
     recovered_this_round = set()
 
-    with open(log_file_path, "a") as log_file:
-        log_file.write(f"Round {round_number} - Failure Log\n")  # Separate failure logs for readability
+    available_clients = [
+        cid for cid, unavailable in unavailability_tracker.items() if unavailable == 0
+    ]
 
-        # ✅ Update failing clients' recovery countdown
-        for client in failure_log:
-          client_id, remaining_time = client[0], client[1]
-          training_time = training_times.get(client_id, 0)  # Get the correct time for each client
-          unavailability_tracker[client_id] = max(0, unavailability_tracker[client_id] - training_time)
-          client[1] = max(0, remaining_time - training_time)
-
-
-        # ✅ Recover clients whose failure time reaches 0
-        recovered_clients = [c for c in failure_log if c[1] == 0]
-        recovered_this_round = {c[0] for c in recovered_clients}
-
-        for client in recovered_clients:
-            client_id = client[0]
-            remaining_time = client[1]
-            training_time = training_times.get(client_id, 0)
-            recovery_time = training_time - remaining_time
-            unavailability_tracker[client_id] = 0  # Mark client as available
-            recovered_this_round.add(client_id)
+    num_failures = int(len(available_clients) * args['FAILURE_RATE'])
+    num_failures = max(1, num_failures)  # Ensure at least one client fails
 
 
 
-            # ✅ Reset affordable workload for recovered clients
-            for c in clients:
-                if c.cid == client_id:
-                    c.affordable_workload = 0
-                    print(f"🔄 Client {client_id} RECOVERED and is now available.")
+    # Ensure failure is only assigned to NEW available clients, not already failing ones
+    failing_clients = [
+        cid for cid in available_clients if cid not in [c[0] for c in failure_log]
+    ]
 
-                    # ✅ Log recovery event
-                    log_file.write(f"{round_number},{client_id},RECOVERED,0,{recovery_time:.2f},{training_time:.2f},{remaining_time:.2f},,,,\n")
+    failing_clients = random.sample(failing_clients, min(num_failures, len(failing_clients)))
+
+    # Assign failure durations and update log
+    new_failures = []
+
+    for client_id in failing_clients:
+        failure_duration = random.randint(1, args['FAILURE_DURATION'])
+        training_times = {client_id: training_times.get(client_id, 0) for client_id in selected_clients}
+        avg_training_time = np.mean(list(training_times.values())) if training_times else 0  # Assign failure duration
+        recovery_time_remaining = failure_duration - avg_training_time # Initially set full failure time
 
 
-        # Remove recovered clients from failure log
-        failure_log[:] = [c for c in failure_log if c[1] > 0]
+        unavailability_tracker[client_id] = 1  # Mark as unavailable
+        new_failures.append([client_id, failure_duration, recovery_time_remaining])
 
-        selected_clients = selected_clients or []
+        with open(log_file_path, "a") as log_file:
+            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},{recovery_time_remaining},{avg_training_time},0,0,0,0,0:\n")
+            log_file.flush()
 
-        # Identify currently available clients
-        available_clients = [cid for cid in range(args["NUM_DEVICES"])if unavailability_tracker[cid] == 0 and cid not in (selected_clients or []) and cid not in recovered_this_round]
+    # Append new failures to log
+    failure_log.extend(new_failures)
 
-        # Calculate number of failures (ensure at least one)
-        num_failures = max(1, int(len(available_clients) * args['FAILURE_RATE']))
 
-        # Select clients to fail (only from available clients)
-        failing_clients = random.sample(available_clients, min(num_failures, len(available_clients)))
+    # ✅ **Update recovery time for all currently failing clients**
+    for client in failure_log:
+        client[2] -= avg_training_time # Reduce recovery time by failure duration
+        client[2] = max(0, client[2])  # Ensure it doesn’t go negative
+        if client[2] == 0:
+            unavailability_tracker[client[0]] = 0  # Mark as available
+            recovered_this_round.add(client[0])  # Add to set of recovered clients
 
-        # Assign failure durations
-        for client_id in failing_clients:
-            failure_duration = random.randint(1, args['FAILURE_DURATION'])
-            unavailability_tracker[client_id] = failure_duration  # Store failure duration
-            failure_log.append([client_id, failure_duration, training_times])  # Track failures
+    # ✅ **Recover clients whose recovery time reaches 0**
+    recovered_clients = [c for c in failure_log if c[2] == 0]
+    for client in recovered_clients:
+        client_id = client[0]
+        unavailability_tracker[client_id] = 0  # Mark client as available
+        #failure_log.remove(client)  # Remove from failure log
 
-            # ✅ Log failure event
-            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},,,,\n")
+        with open(log_file_path, "a") as log_file:
+            log_file.write(f"{round_number},{client_id},RECOVERED,{failure_duration},{recovery_time_remaining},{avg_training_time},0,0,0,0,0:\n")
+            log_file.flush()
 
     return failure_log, recovered_this_round
 
@@ -359,9 +369,14 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         global client_history
-
+        self.set_parameters(parameters)
+        self.model.train()
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
+        criterion = nn.CrossEntropyLoss()
         client_id = self.cid
+        
 
+        
         # ✅ Ensure client_id exists in client_history
         if client_id not in client_history:
             print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
@@ -370,13 +385,10 @@ class FlowerClient(fl.client.NumPyClient):
                 "training_time": [], "accuracy": []
             }
 
-        num_epochs = config.get("num_epochs", 1)  # Default to 1 if missing
-        num_epochs = int(num_epochs) if num_epochs else 10  # Ensure integer
+        num_epochs = config.get("num_epochs", 60)  # Default to 1 if missing
+        num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
 
-        self.set_parameters(parameters)
-        self.model.train()
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
-        criterion = nn.CrossEntropyLoss()
+
 
         print(f"Client {client_id}: Training for {num_epochs} epochs (Affordable Workload: {self.affordable_workload:.2f})")
 
@@ -391,6 +403,8 @@ class FlowerClient(fl.client.NumPyClient):
 
         end_time = time.time()
         training_time = end_time - start_time
+
+        training_times[client_id] = training_time
 
         client_history[client_id]["training_time"].append(training_time)
         print(f"✅ Client {client_id}: Training completed in {training_time:.2f} sec.")
@@ -470,7 +484,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
         with open("client_task_log.csv", "w") as log_file:
-          log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload\n")
+          log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State\n")
 
 
 
@@ -480,32 +494,24 @@ def HierFL(args, trainloaders, valloaders, testloader):
         training_times = {}
         recovered_this_round = set()
 
-        # ✅ Simulate client failures before training selection
-        failure_log, recovered_this_round = simulate_failures(
-            args, unavailability_tracker, failure_log,
-            round_number, training_times, clients=clients,
-            selected_clients=None
-        )
-
         # ✅ Filter available clients
         available_clients = [
             cid for cid in range(args["NUM_DEVICES"])
             if unavailability_tracker[cid] == 0 and cid not in recovered_this_round
         ]
 
-        # ✅ Log failed clients
-        with open(log_file_path, "a") as log_file:
-            for client in failure_log:
-                client_id, remaining_time = client[0], client[1]
-                if remaining_time > 0:
-                    log_file.write(f"{round_number},{client_id},FAILED,,,,,{remaining_time} sec\n")
 
         if not available_clients:
             print(f"⚠️ No available clients in round {round_number}. Skipping round.")
             continue
 
-        selected_clients = random.sample(available_clients, min(10, len(available_clients)))
+        selected_clients = random.sample(available_clients, int(len(available_clients) * args['CLIENT_FRACTION']))
 
+        # ✅ Simulate client failures before training selection
+        failure_log, recovered_this_round = simulate_failures(
+            args, unavailability_tracker, failure_log,
+            round_number, training_times, selected_clients)
+        
         with open(log_file_path, "a") as log_file:
             for client_id in selected_clients:
                 num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
@@ -570,7 +576,7 @@ def main():
     args = {
         'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':50,
+        'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.5,
@@ -591,7 +597,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
