@@ -37,7 +37,7 @@ if torch.cuda.is_available():
 log_file_path = "training_log.csv"
 if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client ID,NumEpoch,AffordableWorkload,TrainingTime,Status,FailureDuration\n")
+            log_file.write("Round,Client ID,NumEpoch,AffordableWorkload,TrainingTime,Status,FailureDuration,RecoveryTime\n")
 
 ########################################
 # Machine Learning Model (Net)
@@ -192,7 +192,7 @@ class FlowerClient(fl.client.NumPyClient):
       optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
       criterion = nn.CrossEntropyLoss()
 
-      num_epochs = config.get("k1", 1)
+      num_epochs = compute_training_rounds(self)
       start_time = time.time()
 
       for epoch in range(num_epochs):
@@ -230,9 +230,12 @@ def compute_training_rounds(client):
 ########################################
 # Random Failure Simulation
 ########################################
-def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_time):
+def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times):
     """Simulates client failures and updates the failure log dynamically per round."""
      #Identify clients who are available (not currently failing)
+
+    recovered_this_round = set()
+
     available_clients = [
         cid for cid, unavailable in unavailability_tracker.items() if unavailable == 0
     ]
@@ -251,24 +254,31 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
     # Assign failure durations and update log
     new_failures = []
+
     for client_id in failing_clients:
-        failure_duration = random.randint(1, args['FAILURE_DURATION'])  # Assign failure duration
-        recovery_time_remaining = failure_duration  # Initially set full failure time
+        failure_duration = random.randint(1, args['FAILURE_DURATION'])
+        avg_training_time = (sum(training_times.values()) / len(training_times))  # Assign failure duration
+        recovery_time_remaining = failure_duration - avg_training_time # Initially set full failure time
+
 
         unavailability_tracker[client_id] = 1  # Mark as unavailable
         new_failures.append([client_id, failure_duration, recovery_time_remaining])
 
         with open(log_file_path, "a") as log_file:
-            log_file.write(f"{round_number},{client_id},0,0,{training_time},FAILED,{failure_duration}\n")
+            log_file.write(f"{round_number},{client_id},0,0,{avg_training_time},FAILED,{failure_duration},{recovery_time_remaining}:\n")
             log_file.flush()
 
     # Append new failures to log
     failure_log.extend(new_failures)
 
+
     # ✅ **Update recovery time for all currently failing clients**
     for client in failure_log:
-        client[2] -= training_time  # Reduce recovery time by training duration
+        client[2] -= avg_training_time # Reduce recovery time by failure duration
         client[2] = max(0, client[2])  # Ensure it doesn’t go negative
+        if client[2] == 0:
+            unavailability_tracker[client[0]] = 0  # Mark as available
+            recovered_this_round.add(client[0])  # Add to set of recovered clients
 
     # ✅ **Recover clients whose recovery time reaches 0**
     recovered_clients = [c for c in failure_log if c[2] == 0]
@@ -277,7 +287,13 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
         unavailability_tracker[client_id] = 0  # Mark client as available
         #failure_log.remove(client)  # Remove from failure log
 
-    return failure_log
+        with open(log_file_path, "a") as log_file:
+            log_file.write(f"{round_number},{client_id},0,0,{avg_training_time:.2f},RECOVERED,0,0\n")
+            log_file.flush()
+
+
+
+    return failure_log, recovered_this_round
 
 ########################################
 # Hierarchical Federated Learning with Flower
@@ -299,6 +315,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
     # ✅ Track client availability (0 = available, >0 = failure duration remaining)
     unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}
     failure_log = []  # Track failed clients and recovery countdowns
+    training_times = {}  # Track training times for each client
 
     # ✅ Compute k1 values ONCE before training starts
     k1_values = {
@@ -345,20 +362,18 @@ def HierFL(args, trainloaders, valloaders, testloader):
     # ✅ Federated Learning Rounds
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
 
-        start_time = time.time()
-        training_time = 0.0
-
         # ✅ Simulate failures before selecting clients
-        failure_log = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_time)
+        failure_log, recovered_this_round = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times)
 
         # ✅ Select only available clients for training
-        available_clients = [cid for cid in range(args["NUM_DEVICES"]) if unavailability_tracker[cid] == 0]
+        available_clients = [cid for cid in range(args["NUM_DEVICES"]) if unavailability_tracker[cid] == 0 and cid not in recovered_this_round]
 
         if not available_clients:
             print(f"⚠️ No available clients in round {round_number}. Skipping.")
             continue
 
-        selected_clients = random.sample(available_clients, max(1, int(len(available_clients) * args['CLIENT_FRACTION'])))
+        selected_clients = random.sample(available_clients, max(10, int(len(available_clients))) * args['CLIENT_FRACTION'])
+
 
         for client_id in selected_clients:
             num_epochs = k1_values[client_id]  # ✅ k1 remains fixed per client
@@ -439,5 +454,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
