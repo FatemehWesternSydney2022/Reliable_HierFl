@@ -293,6 +293,9 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
     # Assign failure durations and update log
     new_failures = []
+    avg_training_time = 0
+    recovery_time_remaining = 0
+    
 
     for client_id in failing_clients:
         failure_duration = random.randint(1, args['FAILURE_DURATION'])
@@ -325,10 +328,10 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
     for client in recovered_clients:
         client_id = client[0]
         unavailability_tracker[client_id] = 0  # Mark client as available
-        #failure_log.remove(client)  # Remove from failure log
+        failure_log.remove(client)  # Remove from failure log
 
         with open(log_file_path, "a") as log_file:
-            log_file.write(f"{round_number},{client_id},RECOVERED,{failure_duration},{recovery_time_remaining},{avg_training_time},0,0,0,0,0:\n")
+            log_file.write(f"{round_number},{client_id},RECOVERED,0,0,0,0,0,0,0,0:\n")
             log_file.flush()
 
     return failure_log, recovered_this_round
