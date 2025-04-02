@@ -81,7 +81,7 @@ class EdgeDevice:
         self.model = Net()  # Each device has its own local model
 
     def get_client(self):
-      return FlowerClient(self.model, self.trainloader, self.valloader, self.device_id, self.device_id) 
+      return FlowerClient(self.model, self.trainloader, self.valloader, self.device_id, self.device_id)
 
 
 ########################################
@@ -150,13 +150,9 @@ def test(net, testloader):
 ########################################
 def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2):
     """
-    Adjusts the task assignment based on each client's affordable workload and dynamic threshold.
-    Ensures that each client is logged only once per round.
-    
-    :param clients: List of client objects containing workload information.
-    :param round_number: The current global round.
-    :param alpha: Smoothing factor for threshold updates.
-    :param r1, r2: Adjustment factors for workload updates.
+    Linear drop workload adjustment strategy:
+    - Linear Drop affordable workload to 0 .
+    - Otherwise, sample workload based on recent training history.
     """
     global client_previous_bounds  # Access the global dictionary
 
@@ -164,21 +160,28 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
         for client in clients:
             # ❌ Skip unselected clients
             if client.cid not in selected_clients:
-                continue  
+                continue
+
+
+            STAGE_INCREASING = "INCREASING"
+            STAGE_STABLE = "STABLE"
+            STAGE_DROPOUT = "DROPOUT"
+            stage = None
+
 
             # ✅ Step 1: Retrieve previous round bounds if client was selected before
             if client.cid in client_previous_bounds:
                 L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
             else:
                 L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
-            
-            # ✅ Ensure workload is updated only ONCE per round
+
+            # ✅ Normal Worklaod pattern
             if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
                 mu_k = np.random.uniform(50, 60)
                 sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
                 client.affordable_workload = np.random.normal(mu_k, sigma_k)
                 client.affordable_workload_logged = round_number  # Mark as updated for this round
-            
+
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
                 client.lower_bound = 10
@@ -186,11 +189,11 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 client.upper_bound = 20
             if not hasattr(client, 'threshold'):
                 client.threshold = 0
-            
+
             # ✅ Step 2: Maintain previous bounds if client has been selected before
             if client.cid in client_previous_bounds:
                 client.lower_bound, client.upper_bound = client_previous_bounds[client.cid]
-            
+
             # ✅ Step 3: Update threshold
             client.threshold = alpha * client.threshold + (1 - alpha) * client.affordable_workload
 
@@ -199,43 +202,48 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 if client.threshold <= L_tk_before:
                     client.lower_bound += r2
                     client.upper_bound += r2
+                    stage = STAGE_INCREASING
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound += r1
                     client.upper_bound += r2
+                    stage = STAGE_INCREASING
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
-                    client.affordable_workload = H_tk_before
+                client.affordable_workload = client.upper_bound
+                stage = STAGE_INCREASING
+
             elif L_tk_before < client.affordable_workload <= H_tk_before:
                 if client.threshold >= L_tk_before:
                     client.lower_bound = min(client.lower_bound + r2, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r2, 0.5 * H_tk_before)
+                    stage = STAGE_STABLE
+
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
-                    client.affordable_workload = L_tk_before
-                else:
+                    stage = STAGE_STABLE
+                client.affordable_workload = client.lower_bound
+                stage = STAGE_STABLE
+
+            else:
                     client.lower_bound = 0.5 * L_tk_before
                     client.upper_bound = 0.5 * H_tk_before
                     client.affordable_workload = 0
-            
+                    stage = STAGE_DROPOUT
+
             # ✅ Step 5: Capture updated values after adjustment
             L_tk_after = client.lower_bound
             H_tk_after = client.upper_bound
 
             # ✅ Step 6: Store updated bounds for future reference
             client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
-            
-            # ✅ Step 7: Log only the selected clients
-            log_file.write(f"{round_number}\t{client.cid}\t{L_tk_before}\t{H_tk_before}\t{L_tk_after}\t{H_tk_after}\t{round(client.affordable_workload, 2)}\n")
 
-            # ✅ Step 8: **Explicitly update the client's `lower_bound` and `upper_bound` again to ensure consistency**
+            # ✅ Step 7: Explicitly update bounds again
             client.lower_bound = L_tk_after
             client.upper_bound = H_tk_after
 
-
-    return clients
-
+    return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage
 
 ########################################
 # Trainig round adjustment
@@ -269,7 +277,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.upper_bound = 20
         self.threshold = 0
         self.affordable_workload = 0
-        
+
 
 
     def get_parameters(self):
@@ -293,7 +301,9 @@ class FlowerClient(fl.client.NumPyClient):
               "training_time": [], "accuracy": []
           }
 
-      num_epochs = config.get("num_epochs", 1)  # Default to 1 if missing
+
+      num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
+      num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
 
       # ✅ Ensure num_epochs is an integer
       if num_epochs is None:
@@ -336,11 +346,11 @@ def HierFL(args, trainloaders, valloaders, testloader):
     clients = [
         FlowerClient(
             model=Net(),
-            trainloader=trainloaders[i], 
-            testloader=testloader, 
-            valloader=valloaders[i], 
+            trainloader=trainloaders[i],
+            testloader=testloader,
+            valloader=valloaders[i],
             cid=i
-        ) 
+        )
         for i in range(args['NUM_DEVICES'])
     ]
 
@@ -393,14 +403,10 @@ def HierFL(args, trainloaders, valloaders, testloader):
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
         available_clients = list(range(args["NUM_DEVICES"]))
 
-        if len(available_clients) < 2:
-            print(f"⚠️ Very few available clients, reducing selected clients.")
-            selected_clients = available_clients
-        else:
-            selected_clients = random.sample(available_clients, min(10, len(available_clients)))
+        selected_clients = available_clients
 
         # ✅ **Update workloads ONCE per round**
-        clients = adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha=args['alpha'], r1=args['r1'], r2=args['r2'])
+        L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha=args['alpha'], r1=args['r1'], r2=args['r2'])
 
         for client_id in selected_clients:
             # ✅ Compute Training Rounds Dynamically
@@ -461,7 +467,7 @@ def main():
     args = {
         'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':50,
+        'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.5,
@@ -480,5 +486,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
