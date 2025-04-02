@@ -226,17 +226,23 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
-                    stage = STAGE_INCREASING
+                client.affordable_workload = client.upper_bound
+                stage = STAGE_INCREASING
+
             elif L_tk_before < client.affordable_workload <= H_tk_before:
                 if client.threshold >= L_tk_before:
                     client.lower_bound = min(client.lower_bound + r2, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r2, 0.5 * H_tk_before)
                     stage = STAGE_STABLE
+
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
                     stage = STAGE_STABLE
-                else:
+                client.affordable_workload = client.lower_bound
+                stage = STAGE_STABLE
+
+            else:
                     client.lower_bound = 0.5 * L_tk_before
                     client.upper_bound = 0.5 * H_tk_before
                     client.affordable_workload = 0
@@ -249,13 +255,8 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             # ✅ Step 6: Store updated bounds for future reference
             client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
 
-            # ✅ Step 7: Log only the selected clients with prediction
-            log_file.write(
-                f"{round_number},{client.cid},TRAINING,,,{training_time:.2f},{L_tk_before},{H_tk_before},"
-                f"{L_tk_after},{H_tk_after},{client.affordable_workload:.2f} sec\n"
-            )
 
-            # ✅ Step 8: Explicitly update bounds again
+            # ✅ Step 7: Explicitly update bounds again
             client.lower_bound = L_tk_after
             client.upper_bound = H_tk_after
 
@@ -329,7 +330,7 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
         print(failure_history)
 
         with open(log_file_path, "a") as log_file:
-            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},{recovery_time_remaining},{avg_training_time},0,0,0,0,0:\n")
+            log_file.write(f"{round_number},{client_id},FAILED,{failure_duration},{recovery_time_remaining},{avg_training_time},0,0,0,0,0,{failure_duration}:\n")
             log_file.flush()
 
     # Append new failures to log
@@ -484,20 +485,26 @@ def adjust_workload_based_on_failure(client, predict_time_to_failure, r1, r2, to
 
     if client.affordable_workload < max_workload:
         client.affordable_workload += r2  # Increase workload
+        if client.affordable_workload >= max_workload:
+            client.affordable_workload = max_workload - 1  # Ensure it doesn't exceed upper bound
     else:
-        client.affordable_workload -= r1  # Decrease workload
+      
+        client.affordable_workload = 0  # Zero Workload
 
     return client.affordable_workload
 
 ########################################
 # All Predicted failure time and steps together
 ########################################
-def simulate_round(selected_clients, failure_history, r1, r2, model, round_number, ):
+def simulate_round(selected_clients, failure_history, r1, r2, model, round_number,failure_duration):
     for client in selected_clients:
 
 
         # Predict the failure time
         predicted_failure_time = predict_time_to_failure(model, failure_history, client.cid)
+        actual_failure_time = failure_duration  # This is the actual failure time
+        error = abs(predicted_failure_time - actual_failure_time)
+
 
         # Adjust the client's workload dynamically based on failure prediction
         client.affordable_workload = adjust_workload_based_on_failure(client, predicted_failure_time, r1, r2)
@@ -515,7 +522,7 @@ def simulate_round(selected_clients, failure_history, r1, r2, model, round_numbe
 
         # Log the updated data
         with open("client_failure_prediction.csv", "a") as log_file:
-          log_file.write(f"{round_number},{client.cid},{client.affordable_workload:.2f},{predicted_failure_time:.2f}\n")
+          log_file.write(f"{round_number},{client.cid},{client.affordable_workload:.2f},{predicted_failure_time:.2f},{actual_failure_time:.2f},{error:.2f}\n")
 
         
         
@@ -680,7 +687,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State,NextPredictedFailure\n")
+            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State,NextPredictedFailure,ActualFailure,Error\n")
     
 
     # ✅ Train LSTM model at the start
@@ -695,7 +702,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             print(f"⚠️ No available clients in round {round_number}. Skipping round.")
             continue
 
-        selected_clients = random.sample(available_clients, min(10, len(available_clients)))
+        selected_clients = available_clients
 
         # ✅ Simulate failures before selecting clients
         failure_log, recovered_this_round= simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients, lstm_model, failure_history)
