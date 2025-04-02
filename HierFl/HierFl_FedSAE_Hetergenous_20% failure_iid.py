@@ -209,7 +209,8 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
-                    stage = STAGE_INCREASING
+                client.affordable_workload = client.upper_bound 
+                stage = STAGE_INCREASING
 
             elif L_tk_before < client.affordable_workload <= H_tk_before:
                 if client.threshold >= L_tk_before:
@@ -221,8 +222,10 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
                     stage = STAGE_STABLE
+                client.affordable_workload = client.lower_bound
+                stage = STAGE_STABLE
 
-                else:
+            else:
                     client.lower_bound = 0.5 * L_tk_before
                     client.upper_bound = 0.5 * H_tk_before
                     client.affordable_workload = 0
@@ -505,7 +508,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             print(f"⚠️ No available clients in round {round_number}. Skipping round.")
             continue
 
-        selected_clients = random.sample(available_clients, min(10, len(available_clients)))
+        selected_clients = available_clients
 
         # ✅ Simulate failures before selecting clients
         failure_log, recovered_this_round= simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients)
