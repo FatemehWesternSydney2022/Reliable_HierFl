@@ -44,7 +44,7 @@ client_previous_bounds = {}
 log_file_path = "client_task_log.csv"
 if not os.path.exists(log_file_path):
     with open(log_file_path, "w") as log_file:
-        log_file.write("Round, Client, LowerBound_before, UpperBound_before, LowerBound_after, UpperBound_after, ClientAffordableWorkload\n")
+        log_file.write("Round, Client, Status,LowerBound_before, UpperBound_before, LowerBound_after, UpperBound_after, ClientAffordableWorkload,NumEpoch,Stage\n")
 
 
 
@@ -423,6 +423,10 @@ def HierFL(args, trainloaders, valloaders, testloader):
             )
 
             _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
+
+         # ✅ Log training clients with workload details
+            with open(log_file_path, "a") as log_file:
+                log_file.write(f"{round_number},{client_id},TRAINING,{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage}\n")
 
         # ✅ **Edge Aggregation every k2 rounds**
         if round_number % args["k2"] == 0:
