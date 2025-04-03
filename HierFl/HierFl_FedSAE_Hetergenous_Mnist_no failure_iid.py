@@ -16,6 +16,12 @@ import os
 from google.colab import drive
 import pandas as pd
 from math import ceil
+import torch.optim as optim
+import torch.nn.functional as F
+import os
+print("📁 Current working directory:", os.getcwd())
+
+log_file_path = "client_task_log.csv"
 
 ########################################
 # SEED
@@ -35,18 +41,7 @@ if torch.cuda.is_available():
 #history of clients
 ########################################
 client_history = {}
-
-client_previous_bounds = {}
-
-########################################
-# CSV Logging - Ensure File is Created at Start
-########################################
-log_file_path = "client_task_log.csv"
-if not os.path.exists(log_file_path):
-    with open(log_file_path, "w") as log_file:
-        log_file.write("Round, Client, Status,LowerBound_before, UpperBound_before, LowerBound_after, UpperBound_after, ClientAffordableWorkload,NumEpoch,Stage\n")
-
-
+training_times = {}
 
 ########################################
 # Machine Learning Model (Net)
@@ -69,6 +64,8 @@ class Net(nn.Module):
         x = torch.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
 
 ########################################
 # EdgeDevice Class
@@ -148,7 +145,9 @@ def test(net, testloader):
 ########################################
 # Adjust L and H After Each Round
 ########################################
-def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2):
+client_previous_bounds = {}
+
+def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times):
     """
     Linear drop workload adjustment strategy:
     - Linear Drop affordable workload to 0 .
@@ -162,7 +161,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             if client.cid not in selected_clients:
                 continue
 
-
+            training_time = training_times.get(client.cid, 0)
             STAGE_INCREASING = "INCREASING"
             STAGE_STABLE = "STABLE"
             STAGE_DROPOUT = "DROPOUT"
@@ -176,11 +175,12 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
             # ✅ Normal Worklaod pattern
+            
             if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
-                mu_k = np.random.uniform(50, 60)
-                sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
-                client.affordable_workload = np.random.normal(mu_k, sigma_k)
-                client.affordable_workload_logged = round_number  # Mark as updated for this round
+                  mu_k = np.random.uniform(50, 60)
+                  sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
+                  client.affordable_workload = np.random.normal(mu_k, sigma_k)
+                  client.affordable_workload_logged = round_number  # Mark as updated for this round
 
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
@@ -209,9 +209,10 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                     stage = STAGE_INCREASING
                 else:
                     client.lower_bound += r1
-                    client.upper_bound += r1
-                client.affordable_workload = client.upper_bound
+                    client.upper_bound += r1      
+                client.affordable_workload = H_tk_before
                 stage = STAGE_INCREASING
+
 
             elif L_tk_before < client.affordable_workload <= H_tk_before:
                 if client.threshold >= L_tk_before:
@@ -223,7 +224,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
                     stage = STAGE_STABLE
-                client.affordable_workload = client.lower_bound
+                client.affordable_workload = L_tk_before
                 stage = STAGE_STABLE
 
             else:
@@ -239,11 +240,13 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             # ✅ Step 6: Store updated bounds for future reference
             client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
 
+
             # ✅ Step 7: Explicitly update bounds again
             client.lower_bound = L_tk_after
             client.upper_bound = H_tk_after
 
     return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage
+
 
 ########################################
 # Trainig round adjustment
@@ -273,12 +276,23 @@ class FlowerClient(fl.client.NumPyClient):
         self.valloader = valloader
         self.cid = cid
 
+        # ✅ Initialize affordable workload
+        self.affordable_workload = self.initialize_affordable_workload()
         self.lower_bound = 10
         self.upper_bound = 20
         self.threshold = 0
+
+
+    def initialize_affordable_workload(self):
+        """Generate a client's affordable workload using a normal distribution."""
+        mu_k = np.random.uniform(50, 60)  # Mean workload
+        sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
+        return max(0, np.random.normal(mu_k, sigma_k))  # Ensure workload is non-negative
+
+    def reset_affordable_workload(self):
+        """Reset affordable workload when a client recovers from failure."""
         self.affordable_workload = 0
-
-
+        print(f"🔄 Client {self.cid} recovered. Affordable workload reset to 0.")
 
     def get_parameters(self):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -289,51 +303,48 @@ class FlowerClient(fl.client.NumPyClient):
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
-      global client_history
-
-      client_id = self.cid
-
-      # ✅ Ensure client_id exists in client_history before using it
-      if client_id not in client_history:
-          print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
-          client_history[client_id] = {
-              "L": 10, "H": 20, "epochs": 10, "task": "Easy",
-              "training_time": [], "accuracy": []
-          }
+        global client_history
+        self.set_parameters(parameters)
+        self.model.train()
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
+        criterion = nn.CrossEntropyLoss()
+        client_id = self.cid
 
 
-      num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
-      num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
 
-      # ✅ Ensure num_epochs is an integer
-      if num_epochs is None:
-          print(f"⚠️ Warning: 'num_epochs' is None for client {client_id}. Defaulting to 10.")
-          num_epochs = 10
-      num_epochs = int(num_epochs)  # Force integer conversion
+        # ✅ Ensure client_id exists in client_history
+        if client_id not in client_history:
+            print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
+            client_history[client_id] = {
+                "L": 10, "H": 20, "epochs": 10, "task": "Easy",
+                "training_time": [], "accuracy": []
+            }
 
-      self.set_parameters(parameters)
-      self.model.train()
-      optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
-      criterion = nn.CrossEntropyLoss()
+        num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
+        num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
 
-      print(f"Client {client_id}: Training for {num_epochs} epochs.")
 
-      start_time = time.time()
-      for epoch in range(num_epochs):
-          for inputs, labels in self.trainloader:
-              optimizer.zero_grad()
-              outputs = self.model(inputs)
-              loss = criterion(outputs, labels)
-              loss.backward()
-              optimizer.step()
 
-      end_time = time.time()
-      training_time = end_time - start_time
+        print(f"Client {client_id}: Training for {num_epochs} epochs (Affordable Workload: {self.affordable_workload:.2f})")
 
-      client_history[client_id]["training_time"].append(training_time)
-      print(f"✅ Client {client_id}: Training completed in {training_time:.2f} sec.")
+        start_time = time.time()
+        for epoch in range(num_epochs):
+            for inputs, labels in self.trainloader:
+                optimizer.zero_grad()
+                outputs = self.model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
 
-      return self.get_parameters(), len(self.trainloader.dataset), {"training_time": training_time}
+        end_time = time.time()
+        training_time = end_time - start_time
+
+        training_times[client_id] = training_time
+
+        client_history[client_id]["training_time"].append(training_time)
+        print(f"✅ Client {client_id}: Training completed in {training_time:.2f} sec.")
+
+        return self.get_parameters(), len(self.trainloader.dataset), {"training_time": training_time}
 
 
 ########################################
@@ -341,6 +352,15 @@ class FlowerClient(fl.client.NumPyClient):
 #######################################
 def HierFL(args, trainloaders, valloaders, testloader):
     global client_history
+    global_model = Net()
+    global_weights = get_parameters(global_model)
+
+    log_file_path = "client_task_log.csv"
+
+    # ✅ Initialize Failure Tracking (Only once)
+    unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}  # 0 = available, >0 = failure duration
+    failure_log = []  # Store failures (Client ID, Failure Duration, Recovery Time)
+    training_times = {}  # Store training times for each client
 
     # ✅ Initialize Clients Once
     clients = [
@@ -365,9 +385,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
         devices = edge_devices[start_idx:] if i == num_edge_servers - 1 else edge_devices[start_idx: start_idx + devices_per_server]
         edge_servers.append(EdgeServer(i, devices))
 
-    # ✅ Global Model
-    global_model = Net()
-    global_weights = get_parameters(global_model)
+
 
     # ✅ Define Evaluation Function
     def evaluate_fn(server_round, parameters, config):
@@ -399,48 +417,66 @@ def HierFL(args, trainloaders, valloaders, testloader):
         strategy=strategy
     )
 
-    # ✅ Federated Learning Rounds
+    # ✅ Ensure CSV file exists before starting logging
+    if not os.path.exists(log_file_path):
+        with open(log_file_path, "w") as log_file:
+            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State\n")
+
+
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
-        available_clients = list(range(args["NUM_DEVICES"]))
+        start_time = time.time()
+
+        # ✅ Select only available clients for training
+        available_clients = [cid for cid in range(args["NUM_DEVICES"])]
+        if not available_clients:
+            print(f"⚠️ No available clients in round {round_number}. Skipping round.")
+            continue
 
         selected_clients = available_clients
 
-        # ✅ **Update workloads ONCE per round**
-        L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha=args['alpha'], r1=args['r1'], r2=args['r2'])
+        L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(
+            round_number=round_number,
+            clients=clients,
+            selected_clients=selected_clients,
+            alpha=args['alpha'],
+            r1=args['r1'],
+            r2=args['r2'],
+            training_times=training_times,  # ideally tracked over rounds
+            log_file_path=log_file_path,
+
+        )
+
 
         for client_id in selected_clients:
-            # ✅ Compute Training Rounds Dynamically
+
             num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
+            client = clients[client_id]  # ✅ Correctly reference the client
 
-            print(f"Client {client_id}: Assigned {num_epochs} epochs (Affordable Workload: {clients[client_id].affordable_workload:.2f})")
-
-            client = FlowerClient(
-                model=Net(),
-                trainloader=trainloaders[client_id],
-                testloader=testloader,
-                valloader=valloaders[client_id],
-                cid=client_id
-            )
-
+            # ✅ Train the client before logging
             _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
+            training_time = train_metrics["training_time"]
+            training_times[client_id] = training_time
 
-         # ✅ Log training clients with workload details
+
+            # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage}\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage}\n")
 
-        # ✅ **Edge Aggregation every k2 rounds**
+
+        # ✅ Edge Aggregation
         if round_number % args["k2"] == 0:
             print(f"🔹 Aggregating at EDGE SERVER (every {args['k2']} rounds)")
             for edge_server in edge_servers:
                 aggregated_params = edge_server.aggregate()
                 set_parameters(edge_server.model, aggregated_params)
 
-        # ✅ **Global Aggregation every (k1 × k2) rounds**
+        # ✅ Global Aggregation
         if round_number % (args["k1"] * args["k2"]) == 0:
             print(f"🌍 Aggregating at GLOBAL SERVER (every {args['k1'] * args['k2']} rounds)")
             global_weights = get_parameters(global_model)
             set_parameters(global_model, global_weights)
 
+    print(f"✅ Finished {args['GLOBAL_ROUNDS']} rounds. Check {log_file_path} for logs.")
 
 
 ########################################
@@ -474,8 +510,8 @@ def main():
         'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        'CLIENT_FRACTION': 0.5,
-        'EVALUATE_FRACTION': 0.5,
+        'CLIENT_FRACTION': 0.2,
+        'EVALUATE_FRACTION': 0.2,
         'alpha': 0.95,
         'r1': 3,
         'r2': 1,
