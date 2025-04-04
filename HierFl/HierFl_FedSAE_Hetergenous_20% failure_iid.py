@@ -175,11 +175,12 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
             # ✅ Normal Worklaod pattern
-            if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
-                mu_k = np.random.uniform(50, 60)
-                sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
-                client.affordable_workload = np.random.normal(mu_k, sigma_k)
-                client.affordable_workload_logged = round_number  # Mark as updated for this round
+            for client in clients:
+              if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
+                    mu_k = np.random.uniform(50, 60)
+                    sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
+                    client.affordable_workload = np.random.normal(mu_k, sigma_k)
+                    client.affordable_workload_logged = round_number  # Mark as updated for this round
 
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
@@ -209,7 +210,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
-                client.affordable_workload = client.upper_bound 
+                client.affordable_workload = H_tk_before
                 stage = STAGE_INCREASING
 
             elif L_tk_before < client.affordable_workload <= H_tk_before:
@@ -221,8 +222,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
-                    stage = STAGE_STABLE
-                client.affordable_workload = client.lower_bound
+                client.affordable_workload = L_tk_before
                 stage = STAGE_STABLE
 
             else:
@@ -248,7 +248,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             client.lower_bound = L_tk_after
             client.upper_bound = H_tk_after
 
-    return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage 
+    return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage
 
 
 ########################################
@@ -298,7 +298,7 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
     new_failures = []
     avg_training_time = 0
     recovery_time_remaining = 0
-    
+
 
     for client_id in failing_clients:
         failure_duration = random.randint(1, args['FAILURE_DURATION'])
@@ -331,10 +331,10 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
     for client in recovered_clients:
         client_id = client[0]
         unavailability_tracker[client_id] = 0  # Mark client as available
-        failure_log.remove(client)  # Remove from failure log
+        #failure_log.remove(client)  # Remove from failure log
 
         with open(log_file_path, "a") as log_file:
-            log_file.write(f"{round_number},{client_id},RECOVERED,0,0,0,0,0,0,0,0:\n")
+            log_file.write(f"{round_number},{client_id},RECOVERED,0,{recovery_time_remaining},{avg_training_time},0,0,0,0,0:\n")
             log_file.flush()
 
     return failure_log, recovered_this_round
@@ -385,9 +385,9 @@ class FlowerClient(fl.client.NumPyClient):
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
         criterion = nn.CrossEntropyLoss()
         client_id = self.cid
-        
 
-        
+
+
         # ✅ Ensure client_id exists in client_history
         if client_id not in client_history:
             print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
@@ -508,7 +508,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             print(f"⚠️ No available clients in round {round_number}. Skipping round.")
             continue
 
-        selected_clients = available_clients
+        selected_clients = random.sample(available_clients, min(10, len(available_clients)))
 
         # ✅ Simulate failures before selecting clients
         failure_log, recovered_this_round= simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients)
@@ -522,9 +522,9 @@ def HierFL(args, trainloaders, valloaders, testloader):
             r2=args['r2'],
             training_times=training_times,  # ideally tracked over rounds
             log_file_path=log_file_path,
-   
+
         )
-        
+
 
         for client_id in selected_clients:
 
@@ -536,7 +536,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             training_time = train_metrics["training_time"]
             training_times[client_id] = training_time
 
-            
+
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
                 log_file.write(f"{round_number},{client_id},TRAINING,0,0,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage}\n")
