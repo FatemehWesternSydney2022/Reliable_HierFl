@@ -192,11 +192,12 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
             # ✅ Normal Worklaod pattern
-            if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
-                mu_k = np.random.uniform(50, 60)
-                sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
-                client.affordable_workload = np.random.normal(mu_k, sigma_k)
-                client.affordable_workload_logged = round_number  # Mark as updated for this round
+            for client in clients:
+              if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
+                  mu_k = np.random.uniform(50, 60)
+                  sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
+                  client.affordable_workload = np.random.normal(mu_k, sigma_k)
+                  client.affordable_workload_logged = round_number  # Mark as updated for this round
 
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
@@ -226,7 +227,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
-                client.affordable_workload = client.upper_bound
+                client.affordable_workload = H_tk_before
                 stage = STAGE_INCREASING
 
             elif L_tk_before < client.affordable_workload <= H_tk_before:
@@ -239,7 +240,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
                     stage = STAGE_STABLE
-                client.affordable_workload = client.lower_bound
+                client.affordable_workload = L_tk_before
                 stage = STAGE_STABLE
 
             else:
@@ -399,7 +400,7 @@ def prepare_failure_data(history, sequence_length=5):
 ########################################
 def train_failure_predictor(failure_history, epochs=60, lr=0.001):
     X, y = prepare_failure_data(failure_history)
-    
+
     if X is None:
         print("❌ Not enough history to train LSTM.")
         return None
@@ -424,7 +425,7 @@ def train_failure_predictor(failure_history, epochs=60, lr=0.001):
 
         if epoch % 10 == 0:
             print(f"Epoch {epoch}: loss = {loss.item():.4f}")
-    
+
     return model
 
 
@@ -488,7 +489,7 @@ def adjust_workload_based_on_failure(client, predict_time_to_failure, r1, r2, to
         if client.affordable_workload >= max_workload:
             client.affordable_workload = max_workload - 1  # Ensure it doesn't exceed upper bound
     else:
-      
+
         client.affordable_workload = 0  # Zero Workload
 
     return client.affordable_workload
@@ -524,8 +525,8 @@ def simulate_round(selected_clients, failure_history, r1, r2, model, round_numbe
         with open("client_failure_prediction.csv", "a") as log_file:
           log_file.write(f"{round_number},{client.cid},{client.affordable_workload:.2f},{predicted_failure_time:.2f},{actual_failure_time:.2f},{error:.2f}\n")
 
-        
-        
+
+
     # Calculate the total workload for this round
     total_workload = calculate_total_workload(selected_clients)
     print(f"Total Workload for Round {round_number}: {total_workload} units")
@@ -575,9 +576,9 @@ class FlowerClient(fl.client.NumPyClient):
         optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
         criterion = nn.CrossEntropyLoss()
         client_id = self.cid
-        
 
-        
+
+
         # ✅ Ensure client_id exists in client_history
         if client_id not in client_history:
             print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
@@ -688,7 +689,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
             log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State,NextPredictedFailure,ActualFailure,Error\n")
-    
+
 
     # ✅ Train LSTM model at the start
     lstm_model = train_failure_predictor(client_failure_history)
@@ -709,7 +710,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
         # ✅ Adjust workloads before selecting clients using failure predictions
         training_times = {client.cid: client_history.get(client.cid, {}).get("training_time", [0])[-1] for client in clients}
-        
+
         L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(
                 round_number=round_number,
                 clients=clients,
@@ -737,7 +738,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
                 log_file.write(f"{round_number},{client_id},TRAINING,,0,0,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage},0\n")
-            
+
             with open("client_failure_prediction.csv", "a") as log_file:
                 log_file.write(f"{round_number},{client.cid},{predicted_time:.2f}\n")
 
