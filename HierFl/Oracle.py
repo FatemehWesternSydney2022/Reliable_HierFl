@@ -175,11 +175,12 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
             # ✅ Normal Worklaod pattern
-            if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
-                mu_k = np.random.uniform(50, 60)
-                sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
-                client.affordable_workload = np.random.normal(mu_k, sigma_k)
-                client.affordable_workload_logged = round_number  # Mark as updated for this round
+            for client in clients:
+              if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
+                  mu_k = np.random.uniform(50, 60)
+                  sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
+                  client.affordable_workload = np.random.normal(mu_k, sigma_k)
+                  client.affordable_workload_logged = round_number  # Mark as updated for this round
 
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
@@ -210,9 +211,9 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 else:
                     client.lower_bound += r1
                     client.upper_bound += r1
-                client.affordable_workload = client.upper_bound
+                client.affordable_workload = H_tk_before
                 stage = STAGE_INCREASING
-        
+
 
             elif L_tk_before < client.affordable_workload <= H_tk_before:
                 if client.threshold >= L_tk_before:
@@ -223,7 +224,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 elif L_tk_before < client.threshold <= H_tk_before:
                     client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
                     client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
-                client.affordable_workload = client.lower_bound
+                client.affordable_workload = L_tk_before
                 stage = STAGE_STABLE
             else:
                     client.lower_bound = 0.5 * L_tk_before
