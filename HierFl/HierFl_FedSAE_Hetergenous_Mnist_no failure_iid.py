@@ -175,12 +175,12 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
                 L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
             # ✅ Normal Worklaod pattern
-            
-            if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
-                  mu_k = np.random.uniform(50, 60)
-                  sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
-                  client.affordable_workload = np.random.normal(mu_k, sigma_k)
-                  client.affordable_workload_logged = round_number  # Mark as updated for this round
+            for client in clients:
+              if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
+                    mu_k = np.random.uniform(50, 60)
+                    sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
+                    client.affordable_workload = np.random.normal(mu_k, sigma_k)
+                    client.affordable_workload_logged = round_number  # Mark as updated for this round
 
             # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
