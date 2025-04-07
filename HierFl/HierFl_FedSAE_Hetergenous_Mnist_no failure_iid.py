@@ -1,3 +1,5 @@
+from logging import log
+from re import L
 import flwr as fl
 from typing import Dict, List, Optional, Tuple
 import torch
@@ -154,8 +156,20 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
     - Otherwise, sample workload based on recent training history.
     """
     global client_previous_bounds  # Access the global dictionary
+    args = {
+        'GLOBAL_ROUNDS': 3,
+        'alpha': 0.95
+    }
+
+    client = next(c for c in clients if c.cid in selected_clients)
+                # ✅ Step 1: Retrieve previous round bounds if client was selected before
+    if client.cid in client_previous_bounds:
+                L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
+    else:
+                L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
     with open(log_file_path, "a") as log_file:
+      for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
         for client in clients:
             # ❌ Skip unselected clients
             if client.cid not in selected_clients:
@@ -163,89 +177,90 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
 
             training_time = training_times.get(client.cid, 0)
             STAGE_INCREASING = "INCREASING"
-            STAGE_STABLE = "STABLE"
             STAGE_DROPOUT = "DROPOUT"
+            STAGE_ARISE = "ARISE"
+            STAGE_STRAGELLER = "STRAGELLER"
+            STAGE_STRETCH = "STRETCH"
             stage = None
 
 
-            # ✅ Step 1: Retrieve previous round bounds if client was selected before
-            if client.cid in client_previous_bounds:
-                L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
-            else:
-                L_tk_before, H_tk_before = client.lower_bound, client.upper_bound  # Use initial values
 
-            # ✅ Normal Worklaod pattern
-            for client in clients:
-              if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
-                    mu_k = np.random.uniform(50, 60)
-                    sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
-                    client.affordable_workload = np.random.normal(mu_k, sigma_k)
-                    client.affordable_workload_logged = round_number  # Mark as updated for this round
 
-            # ✅ Initialize workload range only once
+
+
+            if not hasattr(client, 'affordable_workload_logged') or client.affordable_workload_logged != round_number:
+                      mu_k = np.random.uniform(5, 10)
+                      sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
+                      client.affordable_workload = np.random.normal(mu_k, sigma_k)
+                      print(f"🔄 Client {client.cid} Affordable workload : {client.affordable_workload:.2f}.")
+                      client.affordable_workload_logged = round_number  # Mark as updated for this round
+
+                # ✅ Initialize workload range only once
             if not hasattr(client, 'lower_bound'):
-                client.lower_bound = 10
+                    client.lower_bound = 1
             if not hasattr(client, 'upper_bound'):
-                client.upper_bound = 20
+                    client.upper_bound = 2
             if not hasattr(client, 'threshold'):
-                client.threshold = 0
-
-            # ✅ Step 2: Maintain previous bounds if client has been selected before
-            if client.cid in client_previous_bounds:
-                client.lower_bound, client.upper_bound = client_previous_bounds[client.cid]
+                    client.threshold = 0
 
             # ✅ Step 3: Update threshold
             client.threshold = alpha * client.threshold + (1 - alpha) * client.affordable_workload
 
-            # ✅ Step 4: Adjust workload range based on conditions
+                # ✅ Step 4: Adjust workload range based on conditions
             if client.affordable_workload > H_tk_before:
-                if client.threshold <= L_tk_before:
-                    client.lower_bound += r2
-                    client.upper_bound += r2
-                    stage = STAGE_INCREASING
-                elif L_tk_before < client.threshold <= H_tk_before:
-                    client.lower_bound += r1
-                    client.upper_bound += r2
-                    stage = STAGE_INCREASING
-                else:
-                    client.lower_bound += r1
-                    client.upper_bound += r1      
-                client.affordable_workload = H_tk_before
-                stage = STAGE_INCREASING
-
+                    if client.threshold <= L_tk_before:
+                        client.lower_bound += r2
+                        client.upper_bound += r2
+                        
+                        stage = STAGE_ARISE
+                    elif L_tk_before < client.threshold <= H_tk_before:
+                        client.lower_bound += r1
+                        client.upper_bound += r2
+                        
+                        stage = STAGE_STRETCH
+                    else:
+                        client.lower_bound += r1
+                        client.upper_bound += r1
+                        stage = STAGE_INCREASING
+                    client.affordable_workload = H_tk_before
 
             elif L_tk_before < client.affordable_workload <= H_tk_before:
-                if client.threshold >= L_tk_before:
-                    client.lower_bound = min(client.lower_bound + r2, 0.5 * H_tk_before)
-                    client.upper_bound = max(client.lower_bound + r2, 0.5 * H_tk_before)
-                    stage = STAGE_STABLE
+                    if client.threshold >= L_tk_before:
+                        client.lower_bound = min(client.lower_bound + r2, 0.5 * H_tk_before)
+                        client.upper_bound = max(client.lower_bound + r2, 0.5 * H_tk_before)
+                
+                        stage = STAGE_STRAGELLER
+                        
 
-                elif L_tk_before < client.threshold <= H_tk_before:
-                    client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
-                    client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
-                    stage = STAGE_STABLE
-                client.affordable_workload = L_tk_before
-                stage = STAGE_STABLE
+                    elif L_tk_before < client.threshold <= H_tk_before:
+                        client.lower_bound = min(client.lower_bound + r1, 0.5 * H_tk_before)
+                        client.upper_bound = max(client.lower_bound + r1, 0.5 * H_tk_before)
+                        stage = STAGE_STRAGELLER
+
+                    client.affordable_workload = L_tk_before
+                    
 
             else:
-                    client.lower_bound = 0.5 * L_tk_before
-                    client.upper_bound = 0.5 * H_tk_before
-                    client.affordable_workload = 0
-                    stage = STAGE_DROPOUT
+                        client.lower_bound = 0.5 * L_tk_before
+                        client.upper_bound = 0.5 * H_tk_before
+                        client.affordable_workload = 0
+                        stage = STAGE_DROPOUT
 
-            # ✅ Step 5: Capture updated values after adjustment
+                # ✅ Step 5: Capture updated values after adjustment
             L_tk_after = client.lower_bound
             H_tk_after = client.upper_bound
 
-            # ✅ Step 6: Store updated bounds for future reference
+                # ✅ Step 6: Store updated bounds for future reference
             client_previous_bounds[client.cid] = (L_tk_after, H_tk_after)
 
 
-            # ✅ Step 7: Explicitly update bounds again
-            client.lower_bound = L_tk_after
-            client.upper_bound = H_tk_after
+            log_file.write(f"Round: {round_number}, Client: {client.cid}, Lower Bound: {L_tk_after}, Upper Bound: {H_tk_after}, Stage: {stage}\n")
 
     return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage
+
+
+
+
 
 
 ########################################
@@ -278,14 +293,14 @@ class FlowerClient(fl.client.NumPyClient):
 
         # ✅ Initialize affordable workload
         self.affordable_workload = self.initialize_affordable_workload()
-        self.lower_bound = 10
-        self.upper_bound = 20
+        self.lower_bound = 1
+        self.upper_bound = 2
         self.threshold = 0
 
 
     def initialize_affordable_workload(self):
         """Generate a client's affordable workload using a normal distribution."""
-        mu_k = np.random.uniform(50, 60)  # Mean workload
+        mu_k = np.random.uniform(5, 10)  # Mean workload
         sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
         return max(0, np.random.normal(mu_k, sigma_k))  # Ensure workload is non-negative
 
@@ -310,22 +325,13 @@ class FlowerClient(fl.client.NumPyClient):
         criterion = nn.CrossEntropyLoss()
         client_id = self.cid
 
-
-
-        # ✅ Ensure client_id exists in client_history
         if client_id not in client_history:
-            print(f"⚠️ Warning: Client {client_id} not found in client_history. Initializing with default values.")
-            client_history[client_id] = {
-                "L": 10, "H": 20, "epochs": 10, "task": "Easy",
-                "training_time": [], "accuracy": []
-            }
+            client_history[client_id] = {"training_time": []}
 
         num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
         num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
 
 
-
-        print(f"Client {client_id}: Training for {num_epochs} epochs (Affordable Workload: {self.affordable_workload:.2f})")
 
         start_time = time.time()
         for epoch in range(num_epochs):
@@ -358,8 +364,6 @@ def HierFL(args, trainloaders, valloaders, testloader):
     log_file_path = "client_task_log.csv"
 
     # ✅ Initialize Failure Tracking (Only once)
-    unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}  # 0 = available, >0 = failure duration
-    failure_log = []  # Store failures (Client ID, Failure Duration, Recovery Time)
     training_times = {}  # Store training times for each client
 
     # ✅ Initialize Clients Once
@@ -404,23 +408,23 @@ def HierFL(args, trainloaders, valloaders, testloader):
     )
 
     # ✅ Start Federated Learning Simulation
-    fl.simulation.start_simulation(
-        client_fn=lambda cid: FlowerClient(
-            model=Net(),
-            trainloader=trainloaders[int(cid)],
-            valloader=valloaders[int(cid)],
-            testloader=testloader,
-            cid=int(cid)
-        ),
-        num_clients=len(trainloaders),
-        config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
-        strategy=strategy
-    )
+    #fl.simulation.start_simulation(
+        #client_fn=lambda cid: FlowerClient(
+            #model=Net(),
+            #trainloader=trainloaders[int(cid)],
+            #valloader=valloaders[int(cid)],
+            #testloader=testloader,
+            #cid=int(cid)
+        #),
+        #num_clients=len(trainloaders),
+        #config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
+        #strategy=strategy
+    #)
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State\n")
+            log_file.write("Round,Client,Status,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,NumEpoch,Theta,State\n")
 
 
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
@@ -460,7 +464,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage}\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{client.threshold:.2f},{stage}\n")
 
 
         # ✅ Edge Aggregation
@@ -505,9 +509,9 @@ def main():
         return trainloaders, valloaders, testloader
 
     args = {
-        'NUM_DEVICES': 20,
+        'NUM_DEVICES': 5,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':10,
+        'GLOBAL_ROUNDS':3,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.2,
