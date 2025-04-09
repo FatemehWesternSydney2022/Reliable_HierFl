@@ -186,7 +186,7 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             for client in clients:
               
               
-              mu_k = np.random.uniform(5, 10)
+              mu_k = np.random.uniform(50, 60)
               sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)
               client.affordable_workload = np.random.normal(mu_k, sigma_k)
               print(f"Client {client.cid} Workload: {client.affordable_workload:.2f}")
@@ -195,9 +195,9 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
 
               # ✅ Initialize workload range only once
               if not hasattr(client, 'lower_bound'):
-                  client.lower_bound = 1
+                  client.lower_bound = 10
               if not hasattr(client, 'upper_bound'):
-                  client.upper_bound = 2
+                  client.upper_bound = 20
               if not hasattr(client, 'threshold'):
                   client.threshold = 0
 
