@@ -43,6 +43,7 @@ if torch.cuda.is_available():
 ########################################
 client_history = {}
 training_times = {}
+training_epochs = {}
 
 ########################################
 # Machine Learning Model (Net)
@@ -102,10 +103,43 @@ class EdgeDevice:
 # EdgeServer Class
 ########################################
 class EdgeServer:
-    def __init__(self, server_id, devices: List[EdgeDevice]):
+    def __init__(self, server_id, devices: List[EdgeDevice], backup_servers: List['EdgeServer'] = []):
         self.server_id = server_id
         self.devices = devices
         self.model = Net()  # Each edge server has its own local model
+        self.failed = False  # Track if the server has failed
+        self.backup_servers = backup_servers  # List of backup servers
+    
+    def is_failed(self):
+        return self.failed
+    
+    def handle_failure(self):
+        """Handles the failure of the server and reassigns clients to backup servers."""
+        self.failed = True
+        print(f"Edge server {self.server_id} has failed. Reassigning clients...")
+        
+        # Reassign all clients to available backup servers
+        for backup_server in self.backup_servers:
+            if not backup_server.is_failed():
+                # Transfer all clients to the backup server
+                for device in self.devices:
+                    backup_server.add_device(device)  # Reassign device
+                self.devices.clear()  # Clear the devices from the failed server
+                print(f"Clients reassigned to backup server {backup_server.server_id}.")
+                break  # Exit once we've reassigned to one backup server
+    
+
+    def add_device(self, device: 'EdgeDevice'):
+        """Add a device to the server."""
+        self.devices.append(device)
+
+    def add_client(self, client: 'FlowerClient'):
+        """Add a client to the server."""
+        self.devices.append(client)  # Assuming that `client` is linked to a device
+    
+    def remove_device(self, device: 'EdgeDevice'):
+        """Remove a device from the server."""
+        self.devices.remove(device)
 
     def aggregate(self):
         """Aggregate models from all connected devices."""
@@ -128,6 +162,39 @@ class EdgeServer:
         # Average the parameters
         aggregated_params = [param / total_samples for param in weighted_params]
         return aggregated_params
+
+########################################
+# manages a network of edge servers
+########################################      
+class EdgeServerNetwork:
+    def __init__(self):
+        self.servers = []
+    
+    def add_server(self, server):
+        self.servers.append(server)
+    
+    def find_backup_server(self, failed_server):
+        # Find a non-failed backup server from the failed server's neighbors
+        for neighbor in failed_server.neighbors:
+            if not neighbor.failed:
+                return neighbor
+        return None  # If no available backup server, return None
+
+    def handle_failure(self, failed_server):
+        backup_server = self.find_backup_server(failed_server)
+        if backup_server:
+            failed_server.handle_failure()
+            print(f"Server {failed_server.server_id} is down. Clients reassigned to server {backup_server.server_id}.")
+        else:
+   
+            print("No available backup server found.")
+########################################
+# hold each client’s ID
+########################################
+ 
+class Client:
+    def __init__(self, cid):
+        self.cid = cid  # Client ID
 
 ########################################
 # Parameter Utility Functions
@@ -160,21 +227,39 @@ def test(net, testloader):
     return avg_loss, accuracy
 
 ########################################
+# Avergae Epoch time calculation
+########################################
+def calculate_avg_epochs_per_client(training_epochs, num_clients):
+    total_epochs = sum(training_epochs.values())  # Use epoch counts, not seconds
+    avg_epochs_per_client = total_epochs / num_clients if num_clients > 0 else 0
+    return avg_epochs_per_client
+
+
+########################################
 # Adjust L and H After Each Round
 ########################################
 client_previous_bounds = {}
 
-def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times):
-    """
-    Linear drop workload adjustment strategy:
-    - Linear Drop affordable workload to 0 .
-    - Otherwise, sample workload based on recent training history.
-    """
+def adjust_task_assignment(round_number, clients, selected_clients, log_file_path, alpha, r1, r2, training_times, failure_history, predicted_failure_time, lstm_model, num_epochs):
+
     global client_previous_bounds  # Access the global dictionary
     args = {'GLOBAL_ROUNDS': 50,
             'alpha': 0.95}
+
     
     client = next(c for c in clients if c.cid == selected_clients[0])
+    
+    failure_history = client.failure_history 
+
+    # Get average epoch time per client
+    avg_epoch = calculate_avg_epochs_per_client(training_times, len(clients))
+    print(f"Average epoch time per client: {avg_epoch}")
+    
+    # Adjust r1 and r2 based on average epoch time
+    r1 = r1 * avg_epoch  # r1 as a percentage of average epoch time
+    r2 = r2 * avg_epoch  # r2 as a percentage of average epoch time
+
+
     # ✅ Step 1: Retrieve previous round bounds if client was selected before
     if client.cid in client_previous_bounds:
           L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
@@ -502,28 +587,55 @@ def predict_time_to_failure(model, failure_history, client_id):
 ########################################
 # Maximum Workload Based on Predicted Failure Time
 ########################################
-def adjust_workload_based_on_failure(client, predict_time_to_failure, r1, r2, total_workload,training_times):
+def adjust_workload_based_on_failure(client, predict_time_to_failure, r1, r2, r3, total_workload, training_times, avg_epoch):
     """
     Adjust workload dynamically based on predicted failure time.
     If the failure time is predicted to be close, reduce workload; otherwise, increase.
     """
-    time_per_unit_workload = sum(training_times) / total_workload  # seconds per unit of workload
+    
+
+    # Calculate the average training time per epoch across clients
+    avg_training_time = sum(training_times) / len(training_times)
+
+    
+    # Calculate the time per unit workload (seconds per unit of workload)
+    time_per_unit_workload = avg_training_time / total_workload
+    
+    # Maximum workload based on predicted time to failure
     max_workload = predict_time_to_failure / time_per_unit_workload
 
-    if client.affordable_workload < max_workload:
-        client.affordable_workload += r2  # Increase workload
-        if client.affordable_workload >= max_workload:
-            client.affordable_workload = max_workload - 1  # Ensure it doesn't exceed upper bound
+    failure_ratio = predict_time_to_failure / np.mean(list(avg_epoch.values()))
+    r3_max = max_workload
+    r3 = r3_max * (1 - np.exp(-failure_ratio))  
+
+    # Define threshold failure as 10% of the predicted failure time
+    threshold_percentage = 0.10  # For example, 10%
+    threshold_failure = predict_time_to_failure * threshold_percentage
+    
+	    # State 1: Increase workload by r2 if affordable workload is less than max_workload and failure time is approaching
+    if client.affordable_workload < max_workload and predict_time_to_failure < threshold_failure:
+        client.affordable_workload += r2
+ 
+    # State 2: Increase workload by r1 if we are not close to failure and in the middle of the workload range
+    elif (predict_time_to_failure >= threshold_failure and 
+          client.affordable_workload < max_workload):
+        client.affordable_workload += r1
+ 
+    # State 3: Approaching failure and max_workload, increase workload by r3
     else:
-
-        client.affordable_workload = 0  # Zero Workload
-
+        client.affordable_workload += r3
+ 
+    # If we exceed max workload, drop the workload to zero
+    if client.affordable_workload > max_workload:
+        client.affordable_workload = 0
+ 
     return client.affordable_workload
+
 
 ########################################
 # All Predicted failure time and steps together
 ########################################
-def simulate_round(selected_clients, failure_history, r1, r2, model, round_number,failure_duration):
+def simulate_round(selected_clients, failure_history, r1, r2, model, round_number,failure_duration,r3):
     for client in selected_clients:
 
 
@@ -534,7 +646,7 @@ def simulate_round(selected_clients, failure_history, r1, r2, model, round_numbe
 
 
         # Adjust the client's workload dynamically based on failure prediction
-        client.affordable_workload = adjust_workload_based_on_failure(client, predicted_failure_time, r1, r2)
+        client.affordable_workload = adjust_workload_based_on_failure(client, predicted_failure_time, r1, r2, r3)
 
         # Update the task assignment stage (Increasing, Stable, Dropout)
         if predicted_failure_time <= 0:
@@ -558,9 +670,64 @@ def simulate_round(selected_clients, failure_history, r1, r2, model, round_numbe
     print(f"Total Workload for Round {round_number}: {total_workload} units")
 
 ########################################
+# compute energy per sample
+########################################    
+def compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity):
+
+    # Compute the computational energy (in Joules)
+    E_comp = computation_power * train_time_per_sample
+    
+    # Compute the communication energy (in Joules)
+    E_comm = (transmitter_power * (data_size_per_sample / channel_capacity)) * train_time_per_sample
+    
+    # Total energy per sample
+    total_energy = E_comp + E_comm
+    
+    return total_energy
+
+########################################
+# Energy Consumption
+########################################
+def compute_energy(num_samples, model_size_bits, r1, r2, r3, num_clients, channel_capacity, train_time_sample, transmitter_power, avg_epoch):
+    
+    model = Net()
+    num_params = sum(p.numel() for p in model.parameters())
+    model_size_bits = num_params * 32
+    channel_capacity = 1e9
+    transmitter_power = 0.2
+    data_size_per_sample = 1024
+    computation_power = 50
+    train_time_per_sample = avg_epoch * train_time_sample
+
+
+
+    
+
+    # Compute energy for computation
+    energy_comp_sample = compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity)  # Define based on your model size and dataset
+    energyCompConsumed = round((num_samples * energy_comp_sample * r1), 10)
+
+    # Compute communication energy
+    communicationLatency = round((model_size_bits / channel_capacity), 10)
+    energyCommConsumed = round((transmitter_power * communicationLatency * r2), 10)
+
+    energyCommConsumed *= (1 + r3)
+
+    # Training time adjusted based on workload
+    training_time = round((num_samples * train_time_sample * (1 + r3)), 10)
+    
+    # Adjust remaining battery capacity based on energy consumed
+    total_energy_consumed = energyCompConsumed + energyCommConsumed
+
+    
+    return energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time
+
+########################################
 # FlowerClient Class
 ########################################
 class FlowerClient(fl.client.NumPyClient):
+    
+    
 
     def __init__(self, model, trainloader, testloader, valloader, cid):
         self.model = model
@@ -574,6 +741,8 @@ class FlowerClient(fl.client.NumPyClient):
         self.lower_bound = 10
         self.upper_bound = 20
         self.threshold = 0
+        self.failure_history = []
+        self.num_epochs = 0 
 
 
     def initialize_affordable_workload(self):
@@ -615,6 +784,11 @@ class FlowerClient(fl.client.NumPyClient):
 
         num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
         num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
+        self.num_epochs = num_epochs
+        global training_epochs
+          
+        training_epochs[client_id] = num_epochs  
+
 
 
 
@@ -633,7 +807,8 @@ class FlowerClient(fl.client.NumPyClient):
         training_time = end_time - start_time
 
         training_times[client_id] = training_time
-
+        if "training_time" not in client_history[client_id]:
+          client_history[client_id]["training_time"] = []
         client_history[client_id]["training_time"].append(training_time)
         print(f"✅ Client {client_id}: Training completed in {training_time:.2f} sec.")
 
@@ -649,12 +824,52 @@ def HierFL(args, trainloaders, valloaders, testloader):
     global_weights = get_parameters(global_model)
 
     log_file_path = "client_task_log.csv"
+    client_history = {}
+    clients = []  
+    
+    for i in range(args['NUM_DEVICES']):
+        client = FlowerClient(
+            model=Net(),
+            trainloader=trainloaders[i],
+            testloader=testloader,
+            valloader=valloaders[i],
+            cid=i
+        )
+        clients.append(client)
+        client_history[i] = {}
+        client_id = client.cid 
+        
+    # Initialize edge servers and their neighbors
+    server1 = EdgeServer(1, [])
+    server2 = EdgeServer(2, [server1])
+    server3 = EdgeServer(3, [server1])
+    server1.neighbors = [server2, server3]
+    
+    network = EdgeServerNetwork()
+    network.add_server(server1)
+    network.add_server(server2)
+    network.add_server(server3)
 
     # ✅ Initialize Failure Tracking (Only once)
     unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}  # 0 = available, >0 = failure duration
     failure_log = []  # Store failures (Client ID, Failure Duration, Recovery Time)
     training_times = {}  # Store training times for each client
     failure_history = {}  # Store failure timestamps for each client
+    computation_power = 0.5  # in Watts
+    train_time_sample = 0.01  # in seconds
+    transmitter_power = 0.1  # in Watts
+    data_size_per_sample = 1024  # in bits
+    channel_capacity = 1000000  # in bits per second
+    num_samples = 100  # Example: Number of samples processed by the client in this round
+    model_size_bits = 100000  # Example: Model size in bits
+    avg_epoch = 60
+    r1 = 0.3
+    r2 = 0.1
+    r3 = 0.5
+    num_clients = len(trainloaders)
+
+
+    
 
     # ✅ Initialize Clients Once
     clients = [
@@ -698,23 +913,23 @@ def HierFL(args, trainloaders, valloaders, testloader):
     )
 
     # ✅ Start Federated Learning Simulation
-    fl.simulation.start_simulation(
-        client_fn=lambda cid: FlowerClient(
-            model=Net(),
-            trainloader=trainloaders[int(cid)],
-            valloader=valloaders[int(cid)],
-            testloader=testloader,
-            cid=int(cid)
-        ),
-        num_clients=len(trainloaders),
-        config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
-        strategy=strategy
-    )
+    #fl.simulation.start_simulation(
+        #client_fn=lambda cid: FlowerClient(
+            #model=Net(),
+            #trainloader=trainloaders[int(cid)],
+            #valloader=valloaders[int(cid)],
+            #testloader=testloader,
+            #cid=int(cid)
+        #),
+        #num_clients=len(trainloaders),
+        #config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
+        #strategy=strategy
+    #)
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State,NextPredictedFailure,ActualFailure,Error\n")
+            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State,NextPredictedFailure,ActualFailure,Error,energyCompConsumed, energyCommConsumed, TotalEnrgy,TotalTrainingTime \n")
 
 
     # ✅ Train LSTM model at the start
@@ -736,21 +951,33 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
         # ✅ Adjust workloads before selecting clients using failure predictions
         training_times = {client.cid: client_history.get(client.cid, {}).get("training_time", [0])[-1] for client in clients}
+        training_epochs = {client.cid: client.num_epochs for client in clients}
+        avg_epoch = calculate_avg_epochs_per_client(training_epochs, len(clients))
+        print(f"Training epochs per client: {training_epochs}")  # ✅ Debug check
+        print(f"Average epoch time per client: {avg_epoch}")
 
+               
+        predicted_failure_time = predict_time_to_failure(lstm_model, failure_history, client_id)
         L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(
                 round_number=round_number,
                 clients=clients,
                 selected_clients=selected_clients,
                 log_file_path=log_file_path,
                 alpha=args['alpha'],
-                r1=args['r1'],
-                r2=args['r2'],
+                r1=r1,
+                r2=r2,
                 training_times=training_times,  # ideally tracked over rounds
-                lstm_model=lstm_model
+                predicted_failure_time=predicted_failure_time,
+                failure_history=failure_history,
+                lstm_model=lstm_model,
+                num_epochs= args['NUM_EPOCHS'] ,
             )
 
 
         for client_id in selected_clients:
+
+            client = clients[client_id]  # ✅ Correctly reference the client
+            server1.add_client(client)
 
             num_epochs = compute_training_rounds(client_id, clients, args['base_k1'])
             client = clients[client_id]  # ✅ Correctly reference the client
@@ -759,11 +986,31 @@ def HierFL(args, trainloaders, valloaders, testloader):
             _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
             training_time = train_metrics["training_time"]
             training_times[client_id] = training_time
+            total_training_time = sum(training_times.values())
+            energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
+                num_samples=num_samples, 
+                model_size_bits=model_size_bits,
+                r1=r1, 
+                r2=r2, 
+                r3=r3,
+                num_clients=num_clients, 
+                channel_capacity=channel_capacity, 
+                train_time_sample=train_time_sample, 
+                transmitter_power=transmitter_power, 
+                avg_epoch=avg_epoch
+)
+
 
             predicted_time = getattr(client, "predicted_failure_time", -1.0)
+
+            for server in network.servers:
+              if server.is_failed():
+                network.handle_failure(server)
+
+
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,,0,0,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage},0\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,,0,0,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage},0, {energyCompConsumed}, {energyCommConsumed}, {total_energy_consumed}, {total_training_time}\n")
 
             with open("client_failure_prediction.csv", "a") as log_file:
                 log_file.write(f"{round_number},{client.cid},{predicted_time:.2f}\n")
@@ -811,9 +1058,9 @@ def main():
         return trainloaders, valloaders, testloader
 
     args = {
-        'NUM_DEVICES': 20,
+        'NUM_DEVICES': 5,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':50,
+        'GLOBAL_ROUNDS':5,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.2,
@@ -821,10 +1068,11 @@ def main():
         'FAILURE_RATE': 0.2,
         'FAILURE_DURATION': 50,
         'alpha': 0.95,
-        'r1': 3,
-        'r2': 1,
+        'r1': 0.3,
+        'r2': 0.1,
+        'r3': 0.5,
         'base_k1': 60,
-        'num_epochs': 10,
+        'NUM_EPOCHS': 60,
         'k1': 60,  # Local updates parameter
         'k2': 1  # Edge-to-cloud aggregation frequency
     }
