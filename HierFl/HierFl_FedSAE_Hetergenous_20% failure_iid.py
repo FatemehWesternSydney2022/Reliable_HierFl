@@ -360,6 +360,58 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
     return failure_log, recovered_this_round
 
+########################################
+# compute energy per sample
+########################################    
+def compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity):
+
+    # Compute the computational energy (in Joules)
+    E_comp = computation_power * train_time_per_sample
+    
+    # Compute the communication energy (in Joules)
+    E_comm = (transmitter_power * (data_size_per_sample / channel_capacity)) * train_time_per_sample
+    
+    # Total energy per sample
+    total_energy = E_comp + E_comm
+    
+    return total_energy
+
+########################################
+# Energy Consumption
+########################################
+def compute_energy(num_samples, model_size_bits, r1, r2, num_clients, channel_capacity, train_time_sample, transmitter_power,avg_epoch):
+    
+    model = Net()
+    num_params = sum(p.numel() for p in model.parameters())
+    model_size_bits = num_params * 32
+    channel_capacity = 1e9
+    transmitter_power = 0.2
+    data_size_per_sample = 1024
+    computation_power = 50
+    train_time_per_sample = avg_epoch * train_time_sample
+
+
+
+    
+
+    # Compute energy for computation
+    energy_comp_sample = compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity)  # Define based on your model size and dataset
+    energyCompConsumed = round((num_samples * energy_comp_sample * r1), 10)
+
+    # Compute communication energy
+    communicationLatency = round((model_size_bits / channel_capacity), 10)
+    energyCommConsumed = round((transmitter_power * communicationLatency * r2), 10)
+
+    
+
+    # Training time adjusted based on workload
+    training_time = round((num_samples * train_time_sample), 10)
+    
+    # Adjust remaining battery capacity based on energy consumed
+    total_energy_consumed = energyCompConsumed + energyCommConsumed
+
+    
+    return energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time
 
 ########################################
 # FlowerClient Class
@@ -451,6 +503,17 @@ def HierFL(args, trainloaders, valloaders, testloader):
     global client_history
     global_model = Net()
     global_weights = get_parameters(global_model)
+    computation_power = 0.5  # in Watts
+    train_time_sample = 0.01  # in seconds
+    transmitter_power = 0.1  # in Watts
+    data_size_per_sample = 1024  # in bits
+    channel_capacity = 1000000  # in bits per second
+    num_samples = 100  # Example: Number of samples processed by the client in this round
+    model_size_bits = 100000  # Example: Model size in bits
+    r1 = 3
+    r2 = 1
+    avg_epoch = 60
+    num_clients = len(trainloaders)
 
     log_file_path = "client_task_log.csv"
 
@@ -501,23 +564,23 @@ def HierFL(args, trainloaders, valloaders, testloader):
     )
 
     # ✅ Start Federated Learning Simulation
-    fl.simulation.start_simulation(
-        client_fn=lambda cid: FlowerClient(
-            model=Net(),
-            trainloader=trainloaders[int(cid)],
-            valloader=valloaders[int(cid)],
-            testloader=testloader,
-            cid=int(cid)
-        ),
-        num_clients=len(trainloaders),
-        config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
-        strategy=strategy
-    )
+    #fl.simulation.start_simulation(
+        #client_fn=lambda cid: FlowerClient(
+            #model=Net(),
+            #trainloader=trainloaders[int(cid)],
+            #valloader=valloaders[int(cid)],
+            #testloader=testloader,
+            #cid=int(cid)
+        #),
+        #num_clients=len(trainloaders),
+        #config=fl.server.ServerConfig(num_rounds=args['GLOBAL_ROUNDS']),
+        #strategy=strategy
+    #)
 
     # ✅ Ensure CSV file exists before starting logging
     if not os.path.exists(log_file_path):
         with open(log_file_path, "w") as log_file:
-            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State\n")
+            log_file.write("Round,Client,Status,Duration,RecoveryTime,TrainingTime,LowerBound_before,UpperBound_before,LowerBound_after,UpperBound_after,ClientAffordableWorkload,State,CommEnergy,CompEnergy,TotalEnergy\n")
 
 
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
@@ -556,11 +619,26 @@ def HierFL(args, trainloaders, valloaders, testloader):
             _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
             training_time = train_metrics["training_time"]
             training_times[client_id] = training_time
+            total_training_time = sum(training_times.values())
+            
+            # ✅ Compute energy consumption
+            energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
+                num_samples=num_samples, 
+                model_size_bits=model_size_bits,
+                r1=r1, 
+                r2=r2, 
+                num_clients=num_clients, 
+                channel_capacity=channel_capacity, 
+                train_time_sample=train_time_sample, 
+                transmitter_power=transmitter_power, 
+                avg_epoch=avg_epoch
+                
+)
 
 
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,0,0,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage}\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,0,0,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage},{energyCompConsumed}, {energyCommConsumed}, {total_energy_consumed}, {total_training_time}\n")
 
 
         # ✅ Edge Aggregation
