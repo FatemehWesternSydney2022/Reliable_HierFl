@@ -487,7 +487,7 @@ def calculate_total_workload(selected_clients):
 ########################################
 # Training LSTM with Failure History
 ########################################
-def prepare_failure_data(history, sequence_length=5):
+def prepare_failure_data(history, sequence_length=1):
     sequences, labels = [], []
     for client_id, timestamps in history.items():
         print(f"Client ID: {client_id}, Failure Timestamps: {timestamps}")
@@ -546,6 +546,10 @@ def train_failure_predictor(failure_history, epochs=60, lr=0.001):
 def predict_time_to_failure(model, failure_history, client_id):
     if not isinstance(failure_history, dict) or client_id not in failure_history:
         return None
+        
+    if model is None:
+        print("⚠️ No trained LSTM model found. Using fallback prediction.")
+        return 50.0  # <-- fallback prediction value (seconds)
 
     failure_timestamps = failure_history[client_id]
 
@@ -1058,9 +1062,9 @@ def main():
         return trainloaders, valloaders, testloader
 
     args = {
-        'NUM_DEVICES': 5,
+        'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':5,
+        'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.2,
