@@ -297,6 +297,58 @@ def compute_training_rounds(client_id, clients, base_k1):
     # Scale up if training time is too short
     return max(training_rounds, 20)  # Ensures at least 20 epochs
 
+########################################
+# compute energy per sample
+########################################    
+def compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity):
+
+    # Compute the computational energy (in Joules)
+    E_comp = computation_power * train_time_per_sample
+    
+    # Compute the communication energy (in Joules)
+    E_comm = (transmitter_power * (data_size_per_sample / channel_capacity)) * train_time_per_sample
+    
+    # Total energy per sample
+    total_energy = E_comp + E_comm
+    
+    return total_energy
+
+########################################
+# Energy Consumption
+########################################
+def compute_energy(num_samples, model_size_bits, r1, r2, num_clients, channel_capacity, train_time_sample, transmitter_power, avg_epoch):
+    
+    model = Net()
+    num_params = sum(p.numel() for p in model.parameters())
+    model_size_bits = num_params * 32
+    channel_capacity = 1e9
+    transmitter_power = 0.2
+    data_size_per_sample = 1024
+    computation_power = 50
+    train_time_per_sample = avg_epoch * train_time_sample
+
+
+
+    
+
+    # Compute energy for computation
+    energy_comp_sample = compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity)  # Define based on your model size and dataset
+    energyCompConsumed = round((num_samples * energy_comp_sample * r1), 10)
+
+    # Compute communication energy
+    communicationLatency = round((model_size_bits / channel_capacity), 10)
+    energyCommConsumed = round((transmitter_power * communicationLatency * r2), 10)
+
+
+    # Training time adjusted based on workload
+    training_time = round(num_samples * train_time_sample, 10)  
+
+
+    # Adjust remaining battery capacity based on energy consumed
+    total_energy_consumed = energyCompConsumed + energyCommConsumed
+
+    
+    return energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time
 
 
 ########################################
@@ -313,14 +365,14 @@ class FlowerClient(fl.client.NumPyClient):
 
         # ✅ Initialize affordable workload
         self.affordable_workload = self.initialize_affordable_workload()
-        self.lower_bound = 1
-        self.upper_bound = 2
+        self.lower_bound = 10
+        self.upper_bound = 20
         self.threshold = 0
 
 
     def initialize_affordable_workload(self):
         """Generate a client's affordable workload using a normal distribution."""
-        mu_k = np.random.uniform(5, 10)  # Mean workload
+        mu_k = np.random.uniform(50, 60)  # Mean workload
         sigma_k = np.random.uniform(mu_k / 4, mu_k / 2)  # Standard deviation
         return max(0, np.random.normal(mu_k, sigma_k))  # Ensure workload is non-negative
 
@@ -380,6 +432,17 @@ def HierFL(args, trainloaders, valloaders, testloader):
     global client_history
     global_model = Net()
     global_weights = get_parameters(global_model)
+    computation_power = 0.5  # in Watts
+    train_time_sample = 0.01  # in seconds
+    transmitter_power = 0.1  # in Watts
+    data_size_per_sample = 1024  # in bits
+    channel_capacity = 1000000  # in bits per second
+    num_samples = 100  # Example: Number of samples processed by the client in this round
+    model_size_bits = 100000  # Example: Model size in bits
+    r1 = 3
+    r2 = 1
+    num_clients = len(trainloaders)
+    avg_epoch = 60
 
     log_file_path = "client_task_log.csv"
 
@@ -467,6 +530,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
             r2=args['r2'],
             training_times=training_times,  # ideally tracked over rounds
             log_file_path=log_file_path,
+            
 
         )
 
@@ -481,11 +545,27 @@ def HierFL(args, trainloaders, valloaders, testloader):
             print(f"✅ Client {client_id} trained for {num_epochs} epochs.")
             training_time = train_metrics["training_time"]
             training_times[client_id] = training_time
+            total_training_time = sum(training_times.values())
+
+            # ✅ Compute energy consumption
+            energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
+                num_samples=num_samples, 
+                model_size_bits=model_size_bits,
+                r1=r1, 
+                r2=r2, 
+                num_clients=num_clients, 
+                channel_capacity=channel_capacity, 
+                train_time_sample=train_time_sample, 
+                transmitter_power=transmitter_power,
+                avg_epoch= avg_epoch 
+                
+)
+
 
 
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{client.threshold:.2f},{stage}\n")
+                log_file.write(f"{round_number},{client_id},TRAINING,{training_time},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{client.threshold:.2f},{stage},{energyCompConsumed}, {energyCommConsumed}, {total_energy_consumed}, {total_training_time}\n")
 
 
         # ✅ Edge Aggregation
@@ -532,7 +612,7 @@ def main():
     args = {
         'NUM_DEVICES': 20,
         'NUM_EDGE_SERVERS': 5,
-        'GLOBAL_ROUNDS':50,
+        'GLOBAL_ROUNDS':10,
         'LEARNING_RATE': 0.001,
         'DEVICE': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         'CLIENT_FRACTION': 0.2,
