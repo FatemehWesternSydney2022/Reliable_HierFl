@@ -143,6 +143,14 @@ def test(net, testloader):
     return avg_loss, accuracy
 
 ########################################
+# Avergae Epoch time calculation
+########################################
+def calculate_avg_epochs_per_client(training_epochs, num_clients):
+    total_epochs = sum(training_epochs.values())  # Use epoch counts, not seconds
+    avg_epochs_per_client = total_epochs / num_clients if num_clients > 0 else 0
+    return avg_epochs_per_client
+
+########################################
 # Adjust L and H After Each Round
 ########################################
 client_previous_bounds = {}
@@ -158,6 +166,13 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
             'alpha': 0.95}
     
     client = next(c for c in clients if c.cid == selected_clients[0])
+    # Get average epoch time per client
+    avg_epoch = calculate_avg_epochs_per_client(training_times, len(clients))
+    print(f"Average epoch time per client: {avg_epoch}")
+    
+    # Adjust r1 and r2 based on average epoch time
+    r1 = r1 * avg_epoch  # r1 as a percentage of average epoch time
+    r2 = r2 * avg_epoch  # r2 as a percentage of average epoch time
     # ✅ Step 1: Retrieve previous round bounds if client was selected before
     if client.cid in client_previous_bounds:
           L_tk_before, H_tk_before = client_previous_bounds[client.cid]  # Reuse previous values
@@ -380,22 +395,52 @@ def calculate_total_workload(selected_clients):
 ########################################
 # Maximum Workload Based on Predicted Failure Time
 ########################################
-def adjust_workload_based_on_failure(client, predict_time_to_failure, r1, r2, total_workload,training_times):
+def adjust_workload_based_on_failure(client, know_time_to_failure, r1, r2, r3, total_workload, training_times, avg_epoch):
     """
     Adjust workload dynamically based on predicted failure time.
     If the failure time is predicted to be close, reduce workload; otherwise, increase.
     """
-    time_per_unit_workload = sum(training_times) / total_workload  # seconds per unit of workload
-    max_workload = predict_time_to_failure / time_per_unit_workload
+    
 
-    if client.affordable_workload < max_workload:
-        client.affordable_workload += r2  # Increase workload
-        if client.affordable_workload > max_workload:
-            client.affordable_workload = max_workload - 1  # Ensure it doesn't exceed max
+    # Calculate the average training time per epoch across clients
+    avg_training_time = sum(training_times) / len(training_times)
+
+    
+    # Calculate the time per unit workload (seconds per unit of workload)
+    time_per_unit_workload = avg_training_time / total_workload
+    
+    # Maximum workload based on predicted time to failure
+    max_workload = know_time_to_failure / time_per_unit_workload
+
+    failure_ratio = know_time_to_failure / np.mean(list(avg_epoch.values()))
+    r3_max = max_workload
+    r3 = r3_max * (1 - np.exp(-failure_ratio))  
+
+    # Define threshold failure as 10% of the predicted failure time
+    threshold_percentage = 0.10  # For example, 10%
+    threshold_failure = predict_time_to_failure * threshold_percentage
+    
+	    # State 1: Increase workload by r2 if affordable workload is less than max_workload and failure time is approaching
+    if client.affordable_workload < max_workload and predict_time_to_failure < threshold_failure:
+        client.affordable_workload += r2
+ 
+    # State 2: Increase workload by r1 if we are not close to failure and in the middle of the workload range
+    elif (predict_time_to_failure >= threshold_failure and 
+          client.affordable_workload < max_workload):
+        client.affordable_workload += r1
+ 
+    # State 3: Approaching failure and max_workload, increase workload by r3
     else:
-        client.affordable_workload = 0  # Zero Workload
-
+        client.affordable_workload += r3
+ 
+    # If we exceed max workload, drop the workload to zero
+    if client.affordable_workload > max_workload:
+        client.affordable_workload = 0
+ 
     return client.affordable_workload
+
+
+
 
 ########################################
 # All Predicted failure time and steps together
@@ -431,6 +476,58 @@ def simulate_round(selected_clients, failure_history, r1, r2, model, round_numbe
     total_workload = calculate_total_workload(selected_clients)
     print(f"Total Workload for Round {round_number}: {total_workload} units")
 
+########################################
+# compute energy per sample
+########################################    
+def compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity):
+
+    # Compute the computational energy (in Joules)
+    E_comp = computation_power * train_time_per_sample
+    
+    # Compute the communication energy (in Joules)
+    E_comm = (transmitter_power * (data_size_per_sample / channel_capacity)) * train_time_per_sample
+    
+    # Total energy per sample
+    total_energy = E_comp + E_comm
+    
+    return total_energy
+
+########################################
+# Energy Consumption
+########################################
+def compute_energy(num_samples, model_size_bits, r1, r2, r3, num_clients, channel_capacity, train_time_sample, transmitter_power, avg_epoch):
+    
+    model = Net()
+    num_params = sum(p.numel() for p in model.parameters())
+    model_size_bits = num_params * 32
+    channel_capacity = 1e9
+    transmitter_power = 0.2
+    data_size_per_sample = 1024
+    computation_power = 50
+    train_time_per_sample = avg_epoch * train_time_sample
+
+
+
+    
+
+    # Compute energy for computation
+    energy_comp_sample = compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity)  # Define based on your model size and dataset
+    energyCompConsumed = round((num_samples * energy_comp_sample * r1), 10)
+
+    # Compute communication energy
+    communicationLatency = round((model_size_bits / channel_capacity), 10)
+    energyCommConsumed = round((transmitter_power * communicationLatency * r2), 10)
+
+    energyCommConsumed *= (1 + r3)
+
+    # Training time adjusted based on workload
+    training_time = round((num_samples * train_time_sample * (1 + r3)), 10)
+    
+    # Adjust remaining battery capacity based on energy consumed
+    total_energy_consumed = energyCompConsumed + energyCommConsumed
+
+    
+    return energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time
 ########################################
 # FlowerClient Class
 ########################################
@@ -489,6 +586,10 @@ class FlowerClient(fl.client.NumPyClient):
 
         num_epochs = config.get("num_epochs", 60)  # Default to 60 if missing
         num_epochs = int(num_epochs) if num_epochs else 60  # Ensure integer
+        self.num_epochs = num_epochs
+        global training_epochs
+          
+        training_epochs[client_id] = num_epochs 
 
 
 
@@ -521,6 +622,18 @@ def HierFL(args, trainloaders, valloaders, testloader):
     global client_history
     global_model = Net()
     global_weights = get_parameters(global_model)
+    computation_power = 0.5  # in Watts
+    train_time_sample = 0.01  # in seconds
+    transmitter_power = 0.1  # in Watts
+    data_size_per_sample = 1024  # in bits
+    channel_capacity = 1000000  # in bits per second
+    num_samples = 100  # Example: Number of samples processed by the client in this round
+    model_size_bits = 100000  # Example: Model size in bits
+    avg_epoch = 60
+    r1 = 0.3
+    r2 = 0.1
+    r3 = 0.5
+    num_clients = len(trainloaders)
 
     log_file_path = "client_task_log.csv"
 
@@ -608,6 +721,10 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
         # ✅ Adjust workloads before selecting clients using failure predictions
         training_times = {client.cid: client_history.get(client.cid, {}).get("training_time", [0])[-1] for client in clients}
+        training_epochs = {client.cid: client.num_epochs for client in clients}
+        avg_epoch = calculate_avg_epochs_per_client(training_epochs, len(clients))
+        print(f"Training epochs per client: {training_epochs}")  # ✅ Debug check
+        print(f"Average epoch time per client: {avg_epoch}")
 
         L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage = adjust_task_assignment(
                 round_number=round_number,
@@ -633,6 +750,19 @@ def HierFL(args, trainloaders, valloaders, testloader):
             training_times[client_id] = training_time
 
             predicted_time = getattr(client, "predicted_failure_time", -1.0)
+            energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
+                num_samples=num_samples, 
+                model_size_bits=model_size_bits,
+                r1=r1, 
+                r2=r2,
+                r3=r3,
+                num_clients=num_clients, 
+                channel_capacity=channel_capacity, 
+                train_time_sample=train_time_sample, 
+                transmitter_power=transmitter_power, 
+                
+)
+
             # ✅ Log training clients with workload details
             with open(log_file_path, "a") as log_file:
                 log_file.write(f"{round_number},{client_id},TRAINING,,0,0,{training_time:.2f},{L_tk_before},{H_tk_before},{L_tk_after},{H_tk_after},{client.affordable_workload:.2f},{num_epochs},{stage},0\n")
