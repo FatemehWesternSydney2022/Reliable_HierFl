@@ -274,12 +274,6 @@ def adjust_task_assignment(round_number, clients, selected_clients, log_file_pat
               
             return L_tk_before, H_tk_before, L_tk_after, H_tk_after, stage
 
-            
-
-
-
-
-
 
 
 ########################################
@@ -297,21 +291,7 @@ def compute_training_rounds(client_id, clients, base_k1):
     # Scale up if training time is too short
     return max(training_rounds, 20)  # Ensures at least 20 epochs
 
-########################################
-# compute energy per sample
-########################################    
-def compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity):
 
-    # Compute the computational energy (in Joules)
-    E_comp = computation_power * train_time_per_sample
-    
-    # Compute the communication energy (in Joules)
-    E_comm = (transmitter_power * (data_size_per_sample / channel_capacity)) * train_time_per_sample
-    
-    # Total energy per sample
-    total_energy = E_comp + E_comm
-    
-    return total_energy
 
 ########################################
 # Energy Consumption
