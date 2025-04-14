@@ -546,7 +546,7 @@ def train_failure_predictor(failure_history, epochs=60, lr=0.001):
 def predict_time_to_failure(model, failure_history, client_id):
     if not isinstance(failure_history, dict) or client_id not in failure_history:
         return None
-        
+
     if model is None:
         print("⚠️ No trained LSTM model found. Using fallback prediction.")
         return 50.0  # <-- fallback prediction value (seconds)
@@ -673,58 +673,41 @@ def simulate_round(selected_clients, failure_history, r1, r2, model, round_numbe
     total_workload = calculate_total_workload(selected_clients)
     print(f"Total Workload for Round {round_number}: {total_workload} units")
 
-########################################
-# compute energy per sample
-########################################    
-def compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity):
 
-    # Compute the computational energy (in Joules)
-    E_comp = computation_power * train_time_per_sample
-    
-    # Compute the communication energy (in Joules)
-    E_comm = (transmitter_power * (data_size_per_sample / channel_capacity)) * train_time_per_sample
-    
-    # Total energy per sample
-    total_energy = E_comp + E_comm
-    
-    return total_energy
 
 ########################################
 # Energy Consumption
 ########################################
-def compute_energy(num_samples, model_size_bits, r1, r2, r3, num_clients, channel_capacity, train_time_sample, transmitter_power, avg_epoch):
-    
-    model = Net()
-    num_params = sum(p.numel() for p in model.parameters())
-    model_size_bits = num_params * 32
-    channel_capacity = 1e9
-    transmitter_power = 0.2
-    data_size_per_sample = 1024
-    computation_power = 50
-    train_time_per_sample = avg_epoch * train_time_sample
+def compute_energy(
+    affordable_workload,
+    model_size_bits,
+    samples_per_epoch=100,
+    train_time_sample=0.01,       # seconds per sample
+    computation_power=0.5,        # Watts
+    transmitter_power=0.1,        # Watts
+    channel_capacity=1_000_000    # bits per second
+):
+    """
+    Compute energy consumption based on paper-aligned formulation:
+    E_total = E_comp + E_comm
+    """
 
+    # Step 1: Total training time
+    train_time_per_epoch = samples_per_epoch * train_time_sample
+    total_training_time = affordable_workload * train_time_per_epoch
 
+    # Step 2: Computation Energy
+    energy_comp = computation_power * total_training_time
 
-    
+    # Step 3: Communication Energy (model upload only, once per round)
+    transmission_time = model_size_bits / channel_capacity
+    energy_comm = transmitter_power * transmission_time
 
-    # Compute energy for computation
-    energy_comp_sample = compute_energy_per_sample(computation_power, train_time_per_sample, transmitter_power, data_size_per_sample, channel_capacity)  # Define based on your model size and dataset
-    energyCompConsumed = round((num_samples * energy_comp_sample * r1), 10)
+    # Step 4: Total Energy
+    total_energy = energy_comp + energy_comm
 
-    # Compute communication energy
-    communicationLatency = round((model_size_bits / channel_capacity), 10)
-    energyCommConsumed = round((transmitter_power * communicationLatency * r2), 10)
+    return round(energy_comp, 6), round(energy_comm, 6), round(total_energy, 6), round(total_training_time, 4)
 
-    energyCommConsumed *= (1 + r3)
-
-    # Training time adjusted based on workload
-    training_time = round((num_samples * train_time_sample * (1 + r3)), 10)
-    
-    # Adjust remaining battery capacity based on energy consumed
-    total_energy_consumed = energyCompConsumed + energyCommConsumed
-
-    
-    return energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time
 
 ########################################
 # FlowerClient Class
@@ -859,18 +842,14 @@ def HierFL(args, trainloaders, valloaders, testloader):
     failure_log = []  # Store failures (Client ID, Failure Duration, Recovery Time)
     training_times = {}  # Store training times for each client
     failure_history = {}  # Store failure timestamps for each client
-    computation_power = 0.5  # in Watts
-    train_time_sample = 0.01  # in seconds
-    transmitter_power = 0.1  # in Watts
-    data_size_per_sample = 1024  # in bits
-    channel_capacity = 1000000  # in bits per second
-    num_samples = 100  # Example: Number of samples processed by the client in this round
-    model_size_bits = 100000  # Example: Model size in bits
-    avg_epoch = 60
-    r1 = 0.3
-    r2 = 0.1
-    r3 = 0.5
-    num_clients = len(trainloaders)
+    model_size_bits = 1_000_000   # adjust based on your actual model size
+    samples_per_epoch = 100       # adjust if you use different batch/sample sizes
+    train_time_sample = 0.01      # seconds per sample
+    r1 = args['r1']
+    r2 = args['r2']
+    r3 = args['r3']
+
+
 
 
     
@@ -991,18 +970,15 @@ def HierFL(args, trainloaders, valloaders, testloader):
             training_time = train_metrics["training_time"]
             training_times[client_id] = training_time
             total_training_time = sum(training_times.values())
+
+            # Compute energy
+            affordable_workload = client.affordable_workload
             energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
-                num_samples=num_samples, 
-                model_size_bits=model_size_bits,
-                r1=r1, 
-                r2=r2, 
-                r3=r3,
-                num_clients=num_clients, 
-                channel_capacity=channel_capacity, 
-                train_time_sample=train_time_sample, 
-                transmitter_power=transmitter_power, 
-                avg_epoch=avg_epoch
-)
+              affordable_workload=affordable_workload,
+              model_size_bits=model_size_bits,
+              samples_per_epoch=samples_per_epoch,
+              train_time_sample=train_time_sample
+              )
 
 
             predicted_time = getattr(client, "predicted_failure_time", -1.0)
@@ -1072,9 +1048,9 @@ def main():
         'FAILURE_RATE': 0.2,
         'FAILURE_DURATION': 50,
         'alpha': 0.95,
-        'r1': 0.3,
+        'r1': 0.2,
         'r2': 0.1,
-        'r3': 0.5,
+        'r3': 0.8,
         'base_k1': 60,
         'NUM_EPOCHS': 60,
         'k1': 60,  # Local updates parameter
