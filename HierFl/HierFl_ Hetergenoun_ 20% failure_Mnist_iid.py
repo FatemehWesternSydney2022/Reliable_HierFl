@@ -230,7 +230,7 @@ def compute_training_rounds(client):
 ########################################
 # Random Failure Simulation
 ########################################
-def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times):
+def simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients):
     """Simulates client failures and updates the failure log dynamically per round."""
      #Identify clients who are available (not currently failing)
 
@@ -257,7 +257,8 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
     for client_id in failing_clients:
         failure_duration = random.randint(1, args['FAILURE_DURATION'])
-        avg_training_time = (sum(training_times.values()) / len(training_times))  # Assign failure duration
+        training_times = {client_id: training_times.get(client_id, 0) for client_id in selected_clients}
+        avg_training_time =  np.mean(list(training_times.values())) if training_times else 0  # Assign failure duration
         recovery_time_remaining = failure_duration - avg_training_time # Initially set full failure time
 
 
@@ -294,6 +295,38 @@ def simulate_failures(args, unavailability_tracker, failure_log, round_number, t
 
 
     return failure_log, recovered_this_round
+########################################
+# Energy Consumption
+########################################
+def compute_energy(
+    affordable_workload,
+    model_size_bits,
+    samples_per_epoch=100,
+    train_time_sample=0.01,       # seconds per sample
+    computation_power=0.5,        # Watts
+    transmitter_power=0.1,        # Watts
+    channel_capacity=1_000_000    # bits per second
+):
+    """
+    Compute energy consumption based on paper-aligned formulation:
+    E_total = E_comp + E_comm
+    """
+
+    # Step 1: Total training time
+    train_time_per_epoch = samples_per_epoch * train_time_sample
+    total_training_time = affordable_workload * train_time_per_epoch
+
+    # Step 2: Computation Energy
+    energy_comp = computation_power * total_training_time
+
+    # Step 3: Communication Energy (model upload only, once per round)
+    transmission_time = model_size_bits / channel_capacity
+    energy_comm = transmitter_power * transmission_time
+
+    # Step 4: Total Energy
+    total_energy = energy_comp + energy_comm
+
+    return round(energy_comp, 6), round(energy_comm, 6), round(total_energy, 6), round(total_training_time, 4)
 
 ########################################
 # Hierarchical Federated Learning with Flower
@@ -311,6 +344,12 @@ def HierFL(args, trainloaders, valloaders, testloader):
 
     global_model = Net()
     global_weights = get_parameters(global_model)
+    model_size_bits = 1_000_000   # adjust based on your actual model size
+    samples_per_epoch = 100       # adjust if you use different batch/sample sizes
+    train_time_sample = 0.01      # seconds per sample
+
+
+    num_clients = len(trainloaders)
 
     # ✅ Track client availability (0 = available, >0 = failure duration remaining)
     unavailability_tracker = {cid: 0 for cid in range(args['NUM_DEVICES'])}
@@ -363,7 +402,7 @@ def HierFL(args, trainloaders, valloaders, testloader):
     for round_number in range(1, args['GLOBAL_ROUNDS'] + 1):
 
         # ✅ Simulate failures before selecting clients
-        failure_log, recovered_this_round = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times)
+        failure_log, recovered_this_round = simulate_failures(args, unavailability_tracker, failure_log, round_number, training_times, selected_clients)
 
         # ✅ Select only available clients for training
         available_clients = [cid for cid in range(args["NUM_DEVICES"]) if unavailability_tracker[cid] == 0 and cid not in recovered_this_round]
@@ -384,10 +423,22 @@ def HierFL(args, trainloaders, valloaders, testloader):
             # ✅ Pass fixed k1 to client training
             _, _, train_metrics = client.fit(get_parameters(client.model), {"num_epochs": num_epochs})
             training_time = train_metrics["training_time"]
+            training_times[client_id] = training_time
+            total_training_time = sum(training_times.values())
+            
+            # ✅ Compute energy consumption
+            affordable_workload = client.affordable_workload
+            energyCompConsumed, energyCommConsumed, total_energy_consumed, training_time = compute_energy(
+              affordable_workload=affordable_workload,
+              model_size_bits=model_size_bits,
+              samples_per_epoch=samples_per_epoch,
+              train_time_sample=train_time_sample
+              )
+                
 
             # ✅ Log training details
             with open(log_file_path, "a") as log_file:
-                log_file.write(f"{round_number},{client_id},{num_epochs},{client.affordable_workload:.2f},{training_time:.2f},TRAINING,0\n")
+                log_file.write(f"{round_number},{client_id},{num_epochs},{client.affordable_workload:.2f},{training_time:.2f},TRAINING,0,{energyCompConsumed}, {energyCommConsumed}, {total_energy_consumed}, {total_training_time}\n")
                 log_file.flush()
 
         # ✅ Edge Aggregation
@@ -454,6 +505,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
